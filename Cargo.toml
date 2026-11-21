@@ -1,0 +1,20 @@
+[package]
+name = "shopping"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shopping"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+codegen-units = 1
+lto = "fat"
