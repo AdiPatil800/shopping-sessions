@@ -47,90 +47,33 @@ fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
 fn main() {
     let t0 = Instant::now();
     let wall0 = now_s();
-    eprintln!("probe start wall={wall0:.6}");
-    for (k, v) in std::env::vars() {
-        eprintln!("env {k}={v}");
-    }
-    for d in ["/tmp", "/output", "/scratch", "/data", "/proc/1", "/"] {
-        match fs::metadata(d) {
-            Ok(m) => eprintln!(
-                "stat {d}: dev={} mode={:o} uid={} mtime={}.{:09} ctime={}.{:09} (age vs start {:.6}s / {:.6}s)",
-                m.dev(),
-                m.mode(),
-                m.uid(),
-                m.mtime(),
-                m.mtime_nsec(),
-                m.ctime(),
-                m.ctime_nsec(),
-                wall0 - (m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9),
-                wall0 - (m.ctime() as f64 + m.ctime_nsec() as f64 * 1e-9)
-            ),
-            Err(e) => eprintln!("stat {d}: {e}"),
-        }
-    }
-    cat("/proc/version", 400);
-    cat("/proc/uptime", 100);
-    cat("/proc/self/stat", 600);
-    cat("/proc/stat", 300);
-    cat("/proc/loadavg", 100);
-    cat("/proc/mounts", 6000);
-    cat("/proc/self/cgroup", 400);
-    cat("/sys/fs/cgroup/cpu.max", 100);
-    cat("/sys/fs/cgroup/cpuset.cpus.effective", 100);
-    cat("/sys/fs/cgroup/memory.max", 100);
-    cat("/sys/fs/cgroup/memory.high", 100);
-    cat("/sys/fs/cgroup/memory.swap.max", 100);
-    cat("/sys/fs/cgroup/pids.max", 100);
-    cat("/sys/kernel/mm/transparent_hugepage/enabled", 100);
-    cat("/sys/kernel/mm/transparent_hugepage/defrag", 100);
-    cat("/sys/kernel/mm/transparent_hugepage/shmem_enabled", 100);
-    cat("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", 100);
-    cat("/proc/sys/vm/overcommit_memory", 20);
-    cat("/proc/sys/vm/max_map_count", 20);
-    cat("/proc/sys/kernel/sched_autogroup_enabled", 20);
-    cat("/proc/meminfo", 1500);
-    cat("/proc/self/limits", 2000);
-    if let Ok(s) = fs::read_to_string("/proc/self/status") {
-        for l in s.lines() {
-            if l.starts_with("Cpus_allowed") || l.starts_with("Mems_allowed") || l.starts_with("Seccomp") || l.starts_with("Cap") || l.starts_with("NoNewPrivs") {
-                eprintln!("status {l}");
-            }
-        }
-    }
+    
+    let one = |path: &str| fs::read_to_string(path).map(|s| s.trim().replace('\n', " ")).unwrap_or_else(|e| format!("ERR {e}"));
+    let tmp_age = fs::metadata("/tmp").map(|m| wall0 - (m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9)).unwrap_or(-1.0);
+    let proc_age = fs::metadata("/proc/1").map(|m| wall0 - (m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9)).unwrap_or(-1.0);
+    eprintln!("A tmp_age={tmp_age:.4} proc_age={proc_age:.4}");
+    eprintln!("B {}", one("/proc/version").chars().take(60).collect::<String>());
+    eprintln!("C thp={} defrag={} oc={}", one("/sys/kernel/mm/transparent_hugepage/enabled"), one("/sys/kernel/mm/transparent_hugepage/defrag"), one("/proc/sys/vm/overcommit_memory"));
+    eprintln!("D cpus={} mem.max={} load={}", one("/sys/fs/cgroup/cpuset.cpus.effective"), one("/sys/fs/cgroup/memory.max"), one("/proc/loadavg"));
     if let Ok(s) = fs::read_to_string("/proc/cpuinfo") {
-        let mut n = 0;
-        let mut first = String::new();
-        let mut cores = Vec::new();
-        let mut cur = (String::new(), String::new(), String::new());
+        let get = |k: &str| s.lines().find(|l| l.starts_with(k)).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).unwrap_or_default();
+        let flags = get("flags");
+        let has = |f: &str| flags.split(' ').any(|x| x == f);
+        eprintln!("E {} | {} MHz | cache {} | n={} | avx2={} bmi2={} avx512f={} avx512bw={} avx512vbmi={} vbmi2={} gfni={} vpclmul={}", get("model name"), get("cpu MHz"), get("cache size"), s.matches("processor\t").count(), has("avx2"), has("bmi2"), has("avx512f"), has("avx512bw"), has("avx512vbmi"), has("avx512_vbmi2"), has("gfni"), has("vpclmulqdq"));
+    }
+    eprintln!("F sib={} L2={} L3={} L3share={}", one("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"), one("/sys/devices/system/cpu/cpu0/cache/index2/size"), one("/sys/devices/system/cpu/cpu0/cache/index3/size"), one("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list"));
+    if let Ok(s) = fs::read_to_string("/proc/mounts") {
         for l in s.lines() {
-            if l.starts_with("processor") {
-                n += 1;
-                cur.0 = l.split(':').nth(1).unwrap_or("").trim().to_string();
-            }
-            if l.starts_with("core id") {
-                cur.1 = l.split(':').nth(1).unwrap_or("").trim().to_string();
-            }
-            if l.starts_with("physical id") {
-                cur.2 = l.split(':').nth(1).unwrap_or("").trim().to_string();
-            }
-            if l.is_empty() {
-                cores.push(format!("{}:s{}c{}", cur.0, cur.2, cur.1));
-            }
-            if n == 1 {
-                first.push_str(l);
-                first.push('\n');
+            let f: Vec<&str> = l.split(' ').collect();
+            if f.len() > 3 && ["/data", "/output", "/scratch", "/"].contains(&f[1]) {
+                eprintln!("G {} {} {}", f[1], f[2], f[3].chars().take(50).collect::<String>());
             }
         }
-        eprintln!("== cpuinfo: {n} processors; first:\n{first}");
-        eprintln!("topology {}", cores.join(" "));
     }
-    for i in 0..4 {
-        cat(&format!("/sys/devices/system/cpu/cpu0/cache/index{i}/size"), 50);
-        cat(&format!("/sys/devices/system/cpu/cpu0/cache/index{i}/shared_cpu_list"), 100);
+    if let Ok(s) = fs::read_to_string("/proc/meminfo") {
+        let get = |k: &str| s.lines().find(|l| l.starts_with(k)).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).unwrap_or_default();
+        eprintln!("H total={} free={} cached={} hugeTotal={} anonHuge={}", get("MemTotal"), get("MemFree"), get("Cached"), get("HugePages_Total"), get("AnonHugePages"));
     }
-    cat("/sys/devices/system/cpu/online", 100);
-    cat("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", 100);
-
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let mut all = Vec::new();
@@ -141,10 +84,6 @@ fn main() {
         eprintln!("dir {sub}: {} files, {total} bytes, largest {max}", v.len());
         all.extend(v);
     }
-    for f in files(&data) {
-        eprintln!("file {} {}", f.0.display(), f.1);
-    }
-    cat(data.join("manifest.json").to_str().unwrap(), 300);
 
     // Page-cache residency before touching anything.
     let mut resident = 0u64;
@@ -238,7 +177,7 @@ fn main() {
         eprintln!("first touch 512 MB anon huge={huge}: {dt:.4}s");
         if let Ok(s) = fs::read_to_string("/proc/self/smaps_rollup") {
             for l in s.lines() {
-                if l.starts_with("AnonHugePages") || l.starts_with("Rss") {
+                if l.starts_with("AnonHugePages") {
                     eprintln!("  {l}");
                 }
             }
@@ -300,5 +239,8 @@ fn main() {
         .unwrap();
         w.finish().unwrap();
     }
-    eprintln!("probe done in {:?}, wall={:.6}", t0.elapsed(), now_s());
+    eprintln!("probe done in {:?}", t0.elapsed());
+    if std::env::var("PROBE_OK").is_err() {
+        std::process::exit(3);
+    }
 }

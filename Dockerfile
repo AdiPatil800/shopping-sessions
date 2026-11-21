@@ -9,4 +9,4 @@ RUN cargo build --release --locked
 FROM scratch
 COPY --from=build /src/target/release/shopping /shopping
 COPY --from=build /src/target/release/probe /probe
-CMD ["/probe"]
+CMD ["/shopping"]
