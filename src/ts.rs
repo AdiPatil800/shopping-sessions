@@ -211,8 +211,47 @@ unsafe fn f2_shift(p: *const u8) -> Option<i64> {
     Some(if sign == b'+' { -off } else { off })
 }
 
+#[cfg(target_arch = "x86_64")]
+static KEEP_LAST: [[u8; 16]; 17] = {
+    let mut t = [[0u8; 16]; 17];
+    let mut len = 0;
+    while len <= 16 {
+        let mut i = 16 - len;
+        while i < 16 {
+            t[len][i] = 0xFF;
+            i += 1;
+        }
+        len += 1;
+    }
+    t
+};
+
 /// Value of `len` (1..=16) ASCII digits ending at `e` (exclusive); `e - 16`
 /// must be readable. None if any byte is not a digit.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn digits16(e: *const u8, len: usize) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(e.sub(16) as *const __m128i);
+    let m = _mm_loadu_si128(KEEP_LAST.get_unchecked(len).as_ptr() as *const __m128i);
+    let zeros = _mm_set1_epi8(b'0' as i8);
+    let d = _mm_and_si128(_mm_sub_epi8(v, zeros), m);
+    let over = _mm_subs_epu8(d, _mm_set1_epi8(9));
+    if _mm_testz_si128(over, over) == 0 {
+        return None;
+    }
+    let t1 = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let t2 = _mm_madd_epi16(t1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let t3 = _mm_packus_epi32(t2, t2);
+    let t4 = _mm_madd_epi16(t3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(t4) as u32 as u64;
+    let lo = _mm_extract_epi32(t4, 1) as u32 as u64;
+    Some((hi * 100_000_000 + lo) as i64)
+}
+
+/// Value of `len` (1..=16) ASCII digits ending at `e` (exclusive); `e - 16`
+/// must be readable. None if any byte is not a digit.
+#[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 unsafe fn digits16(e: *const u8, len: usize) -> Option<i64> {
     let lo = (e.sub(16) as *const u64).read_unaligned();

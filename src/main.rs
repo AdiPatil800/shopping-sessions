@@ -161,23 +161,23 @@ fn ts_at(b: &[u8], s: usize, e: usize, dc: &mut ts::DateCache) -> Option<i64> {
     }
 }
 
+/// 1 view, 2 cart, 3 purchase, 0 anything else.
 #[inline(always)]
 fn event_kind(b: &[u8], s: usize, e: usize) -> u8 {
     let len = e - s;
-    if len == 4 {
-        let w = u32::from_le_bytes(b[s..s + 4].try_into().unwrap());
-        if w == u32::from_le_bytes(*b"view") {
-            1
-        } else if w == u32::from_le_bytes(*b"cart") {
-            2
-        } else {
-            0
-        }
-    } else if len == 8 && u64::from_le_bytes(b[s..s + 8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
-        3
-    } else {
-        0
+    if s + 8 > b.len() {
+        return match &b[s..e] {
+            b"view" => 1,
+            b"cart" => 2,
+            b"purchase" => 3,
+            _ => 0,
+        };
     }
+    let w = unsafe { (b.as_ptr().add(s) as *const u64).read_unaligned() };
+    let w4 = w as u32;
+    let k4 = (w4 == u32::from_le_bytes(*b"view")) as u8 + 2 * (w4 == u32::from_le_bytes(*b"cart")) as u8;
+    let k8 = 3 * (w == u64::from_le_bytes(*b"purchase")) as u8;
+    (k4 & 0u8.wrapping_sub((len == 4) as u8)) | (k8 & 0u8.wrapping_sub((len == 8) as u8))
 }
 
 #[inline(always)]

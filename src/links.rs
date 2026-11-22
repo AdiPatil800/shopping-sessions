@@ -42,6 +42,19 @@ impl PersonTable {
         }
     }
 
+    #[inline(always)]
+    fn prefetch_parent(&self, i: usize) {
+        let p = unsafe { self.parent.as_ptr().add(i) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags));
+        }
+    }
+
     /// The person name of an ID (the ID itself when it is in no link).
     #[inline(always)]
     pub fn person(&self, k: u64) -> u64 {
@@ -115,7 +128,9 @@ impl PersonTable {
     /// Builds the table from link pairs (one Vec per producer), with `n` threads.
     pub fn build(pairs: &[Vec<(u64, u64)>], n: usize) -> PersonTable {
         let total: usize = pairs.iter().map(|v| v.len()).sum();
+        let t0 = std::time::Instant::now();
         let t = PersonTable::new(total * 3 / 2 + 16);
+        let prof = std::env::var("PROF").is_ok();
         const JOB: usize = 1 << 14;
         let jobs: Vec<(usize, usize)> = pairs.iter().enumerate().flat_map(|(v, p)| (0..p.len()).step_by(JOB).map(move |s| (v, s))).collect();
         let next = AtomicUsize::new(0);
@@ -124,10 +139,13 @@ impl PersonTable {
                 .map(|_| {
                     s.spawn(|| {
                         let mut mine: Vec<u32> = Vec::new();
+                        let mut ids: Vec<(u32, u32)> = Vec::with_capacity(JOB);
                         loop {
                             let j = next.fetch_add(1, Relaxed);
                             let Some(&(v, st)) = jobs.get(j) else { break };
                             let sl = &pairs[v][st..(st + JOB).min(pairs[v].len())];
+                            // 1. insert both ends (table misses hidden by prefetch)
+                            ids.clear();
                             for (i, &(a, b)) in sl.iter().enumerate() {
                                 if let Some(&(c, d)) = sl.get(i + 8) {
                                     t.prefetch(c);
@@ -141,7 +159,17 @@ impl PersonTable {
                                 if nb {
                                     mine.push(ib as u32);
                                 }
-                                t.union(ia, ib);
+                                ids.push((ia as u32, ib as u32));
+                            }
+                            // 2. union (parent entries prefetched)
+                            for (i, &(ia, ib)) in ids.iter().enumerate() {
+                                if let Some(&(c, d)) = ids.get(i + 8) {
+                                    t.prefetch_parent(c as usize);
+                                    t.prefetch_parent(d as usize);
+                                }
+                                if ia != ib {
+                                    t.union(ia as usize, ib as usize);
+                                }
                             }
                         }
                         mine
@@ -150,12 +178,18 @@ impl PersonTable {
                 .collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        if prof {
+            eprintln!("  links: insert+union done at {:.1} ms ({} ids)", t0.elapsed().as_secs_f64() * 1e3, inserted.iter().map(|v| v.len()).sum::<usize>());
+        }
         // every slot learns its root's key
         std::thread::scope(|s| {
             for mine in &inserted {
                 let t = &t;
                 s.spawn(move || {
-                    for &i in mine {
+                    for (k, &i) in mine.iter().enumerate() {
+                        if let Some(&j) = mine.get(k + 8) {
+                            t.prefetch_parent(j as usize);
+                        }
                         let r = t.find(i as usize);
                         let name = t.slots[r][0].load(Relaxed);
                         t.slots[i as usize][1].store(name, Relaxed);
@@ -163,6 +197,9 @@ impl PersonTable {
                 });
             }
         });
+        if prof {
+            eprintln!("  links: names done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
         t
     }
 }
