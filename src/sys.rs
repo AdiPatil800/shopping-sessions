@@ -91,7 +91,9 @@ pub fn anon(len: usize, huge: bool) -> *mut u8 {
         exit_now(3);
     }
     if huge && cfg!(target_os = "linux") {
-        unsafe { madvise(p, len, MADV_HUGEPAGE) };
+        if HUGE_OK.load(Relaxed) {
+            unsafe { madvise(p, len, MADV_HUGEPAGE) };
+        }
     }
     p
 }
@@ -224,4 +226,18 @@ pub fn bump_reset(mark: usize) {
         drop_pages((base + start) as *const u8, end - start);
     }
     BUMP_NEXT.store(start, Relaxed);
+}
+
+/// Whether `anon` asks for huge pages when told to (a knob while measuring).
+pub static HUGE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Benchmark only: huge pages or not for the part of the allocator's
+/// reservation that has not been handed out yet.
+#[cfg(feature = "selfbench")]
+pub fn bump_huge(on: bool) {
+    let base = BUMP_BASE.load(Relaxed);
+    let from = (BUMP_NEXT.load(Relaxed) + (2 << 20) - 1) & !((2 << 20) - 1);
+    if base != 0 && from < BUMP_CAP {
+        unsafe { madvise((base + from) as *mut u8, BUMP_CAP - from, if on { MADV_HUGEPAGE } else { 15 }) };
+    }
 }
