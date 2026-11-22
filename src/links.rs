@@ -1,37 +1,57 @@
 //! Linked IDs, in parallel: a concurrent hash table of 4-slot buckets (one
-//! cache line each) whose slot index is the node id, and a lock-free union-find over slots. A root is only
-//! ever linked under a root with a byte-wise smaller ID, so there are no
-//! cycles and every set's root is its smallest ID: the person's name.
+//! cache line each) whose slot index is the node id, and a lock-free
+//! union-find over slots. A root is only ever linked under a root with a
+//! byte-wise smaller ID, so there are no cycles and every set's root is its
+//! smallest ID: the person's name.
+//!
+//! While the sets are being built a slot's second word is its parent (0 for a
+//! root, else parent + 1), next to its key in the same cache line; when they
+//! are complete it is overwritten with the person's name.
 
 use crate::ids::{cmp_ids, SLOW_BIT};
 use crate::sys;
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 const K2: u64 = 0xD6E8_FEB8_6659_FD93;
 
 pub struct PersonTable {
-    slots: &'static [[AtomicU64; 2]], // (key, person name); key 0 = empty
-    parent: &'static [AtomicU32],     // 0 = root, else parent + 1
+    slots: &'static [[AtomicU64; 2]], // (key, parent while building then person name); key 0 = empty
     strs: &'static [AtomicU64],       // where a hashed key's bytes are (0 for packed keys)
-    shift: u32,
-    mask: usize,
+    nb: u64,    // buckets
+    cap: usize, // slots: 4 a bucket
 }
 
 impl PersonTable {
-    fn new(expected_keys: usize) -> Self {
-        let cap = (expected_keys * 2).next_power_of_two().max(1024);
-        debug_assert!(cap % 4 == 0);
+    /// A table for at most `max_keys` keys: two slots in three taken at the
+    /// very worst, fewer in practice (an ID is usually in several links).
+    fn new(max_keys: usize) -> Self {
+        let nb = (max_keys * 3 / 2 / 4 + 1).max(256);
+        let cap = nb * 4;
         let slots = unsafe { std::slice::from_raw_parts(sys::anon(cap * 16, true) as *const [AtomicU64; 2], cap) };
-        let parent = unsafe { std::slice::from_raw_parts(sys::anon(cap * 4, true) as *const AtomicU32, cap) };
         let strs = unsafe { std::slice::from_raw_parts(sys::anon(cap * 8, true) as *const AtomicU64, cap) };
-        PersonTable { slots, parent, strs, shift: 64 - (cap / 4).trailing_zeros(), mask: cap - 1 }
+        PersonTable { slots, strs, nb: nb as u64, cap }
+    }
+
+    /// Touches the `part`-th of `of` shares of the table, so the kernel hands
+    /// out (and zeroes) its pages on every core at once, not page by page as
+    /// the first insertions happen to land on them.
+    fn touch(&self, part: usize, of: usize) {
+        for (base, bytes) in [(self.slots.as_ptr() as usize, self.cap * 16), (self.strs.as_ptr() as usize, self.cap * 8)] {
+            let (lo, hi) = (bytes / of * part & !4095, if part + 1 == of { bytes } else { bytes / of * (part + 1) & !4095 });
+            let mut o = lo;
+            while o < hi {
+                // a write that changes nothing: other threads may already be inserting here
+                unsafe { (*((base + o) as *const AtomicU64)).fetch_or(0, Relaxed) };
+                o += 4096;
+            }
+        }
     }
 
     /// First slot of the key's bucket (4 slots, one cache line).
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        ((k.wrapping_mul(K2) >> self.shift) as usize) << 2
+        ((((k.wrapping_mul(K2) as u128) * (self.nb as u128)) >> 64) as usize) << 2
     }
 
     #[inline(always)]
@@ -46,9 +66,24 @@ impl PersonTable {
         }
     }
 
+    /// Asks for what a join reads of a root: its key and where its bytes are.
+    #[inline(always)]
+    fn prefetch_root(&self, i: usize) {
+        let (a, b) = unsafe { (self.slots.as_ptr().add(i) as *const u8, self.strs.as_ptr().add(i) as *const u8) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(a as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(b as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", "prfm pldl1keep, [{1}]", in(reg) a, in(reg) b, options(nostack, preserves_flags));
+        }
+    }
+
     #[inline(always)]
     fn prefetch_parent(&self, i: usize) {
-        let p = unsafe { self.parent.as_ptr().add(i) };
+        let p = unsafe { self.slots.as_ptr().add(i) };
         #[cfg(target_arch = "x86_64")]
         unsafe {
             std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
@@ -73,7 +108,7 @@ impl PersonTable {
             if (missing & full as u64) == 0 {
                 return v | (k & missing.wrapping_neg());
             }
-            i = (i + 4) & self.mask;
+            i = if i + 4 >= self.cap { 0 } else { i + 4 };
         }
     }
 
@@ -104,7 +139,7 @@ impl PersonTable {
                     return (j, new);
                 }
             }
-            i = (i + 4) & self.mask;
+            i = if i + 4 >= self.cap { 0 } else { i + 4 };
         }
     }
 
@@ -121,23 +156,23 @@ impl PersonTable {
                     return None;
                 }
             }
-            i = (i + 4) & self.mask;
+            i = if i + 4 >= self.cap { 0 } else { i + 4 };
         }
     }
 
     #[inline]
     fn find(&self, mut x: usize) -> usize {
         loop {
-            let p = self.parent[x].load(Relaxed);
+            let p = self.slots[x][1].load(Relaxed);
             if p == 0 {
                 return x;
             }
             let p = (p - 1) as usize;
-            let gp = self.parent[p].load(Relaxed);
+            let gp = self.slots[p][1].load(Relaxed);
             if gp == 0 {
                 return p;
             }
-            self.parent[x].store(gp, Relaxed);
+            self.slots[x][1].store(gp, Relaxed);
             x = (gp - 1) as usize;
         }
     }
@@ -150,9 +185,10 @@ impl PersonTable {
                 return;
             }
             let (ka, kb) = (self.slots[ra][0].load(Relaxed), self.slots[rb][0].load(Relaxed));
-            let (la, lb) = (self.strs[ra].load(Relaxed), self.strs[rb].load(Relaxed));
-            let (lo, hi) = if cmp_ids(ka, la, kb, lb) == Ordering::Less { (ra, rb) } else { (rb, ra) };
-            if self.parent[hi].compare_exchange(0, lo as u32 + 1, Relaxed, Relaxed).is_ok() {
+            let (la, lb) = if (ka | kb) & SLOW_BIT != 0 { (self.strs[ra].load(Relaxed), self.strs[rb].load(Relaxed)) } else { (0, 0) };
+            let less = cmp_ids(ka, la, kb, lb) == Ordering::Less;
+            let (lo, hi) = if less { (ra, rb) } else { (rb, ra) };
+            if self.slots[hi][1].compare_exchange(0, lo as u64 + 1, Relaxed, Relaxed).is_ok() {
                 return;
             }
         }
@@ -162,47 +198,63 @@ impl PersonTable {
     pub fn build(pairs: &[Vec<(u64, u64, u64, u64)>], n: usize) -> PersonTable {
         let total: usize = pairs.iter().map(|v| v.len()).sum();
         let t0 = std::time::Instant::now();
-        let t = PersonTable::new(total * 3 / 2 + 16);
+        let t = PersonTable::new(total * 2 + 16);
         let prof = std::env::var("PROF").is_ok();
+
         const JOB: usize = 1 << 14;
         let jobs: Vec<(usize, usize)> = pairs.iter().enumerate().flat_map(|(v, p)| (0..p.len()).step_by(JOB).map(move |s| (v, s))).collect();
         let next = AtomicUsize::new(0);
         let inserted: Vec<Vec<u32>> = std::thread::scope(|s| {
             let hs: Vec<_> = (0..n)
-                .map(|_| {
-                    s.spawn(|| {
+                .map(|th| {
+                    let t = &t;
+                    let (next, jobs) = (&next, &jobs);
+                    s.spawn(move || {
+                        t.touch(th, n);
                         let mut mine: Vec<u32> = Vec::new();
                         let mut ids: Vec<(u32, u32)> = Vec::with_capacity(JOB);
                         loop {
                             let j = next.fetch_add(1, Relaxed);
                             let Some(&(v, st)) = jobs.get(j) else { break };
                             let sl = &pairs[v][st..(st + JOB).min(pairs[v].len())];
-                            // 1. insert both ends (table misses hidden by prefetch)
-                            ids.clear();
-                            for (i, &(a, la, b, lb)) in sl.iter().enumerate() {
-                                if let Some(&(c, _, d, _)) = sl.get(i + 8) {
-                                    t.prefetch(c);
-                                    t.prefetch(d);
+                            // A few hundred pairs at a time, so the lines a pair's
+                            // insertion brought in are still in the cache when it
+                            // is joined: insert both ends (misses hidden by
+                            // prefetch), walk to the roots and ask for the lines a
+                            // join reads of them, then join. A join started from
+                            // an old root just walks on if the root has moved.
+                            let mut lo = 0;
+                            while lo < sl.len() {
+                                let hi = (lo + 256).min(sl.len());
+                                ids.clear();
+                                for i in lo..hi {
+                                    if let Some(&(c, _, d, _)) = sl.get(i + 8) {
+                                        t.prefetch(c);
+                                        t.prefetch(d);
+                                    }
+                                    let (a, la, b, lb) = sl[i];
+                                    let (ia, na) = t.insert(a, la);
+                                    let (ib, nb) = t.insert(b, lb);
+                                    if na {
+                                        mine.push(ia as u32);
+                                    }
+                                    if nb {
+                                        mine.push(ib as u32);
+                                    }
+                                    ids.push((ia as u32, ib as u32));
                                 }
-                                let (ia, na) = t.insert(a, la);
-                                let (ib, nb) = t.insert(b, lb);
-                                if na {
-                                    mine.push(ia as u32);
+                                for x in ids.iter_mut() {
+                                    let (ra, rb) = (t.find(x.0 as usize), t.find(x.1 as usize));
+                                    t.prefetch_root(ra);
+                                    t.prefetch_root(rb);
+                                    *x = (ra as u32, rb as u32);
                                 }
-                                if nb {
-                                    mine.push(ib as u32);
+                                for &(ra, rb) in ids.iter() {
+                                    if ra != rb {
+                                        t.union(ra as usize, rb as usize);
+                                    }
                                 }
-                                ids.push((ia as u32, ib as u32));
-                            }
-                            // 2. union (parent entries prefetched)
-                            for (i, &(ia, ib)) in ids.iter().enumerate() {
-                                if let Some(&(c, d)) = ids.get(i + 8) {
-                                    t.prefetch_parent(c as usize);
-                                    t.prefetch_parent(d as usize);
-                                }
-                                if ia != ib {
-                                    t.union(ia as usize, ib as usize);
-                                }
+                                lo = hi;
                             }
                         }
                         mine
@@ -214,18 +266,57 @@ impl PersonTable {
         if prof {
             eprintln!("  links: insert+union done at {:.1} ms ({} ids)", t0.elapsed().as_secs_f64() * 1e3, inserted.iter().map(|v| v.len()).sum::<usize>());
         }
-        // every slot learns its root's key
+        // Every slot learns its root's key, in two rounds: the second word of
+        // a slot is a parent until all the roots are found, a name after.
+        let roots: Vec<Vec<u32>> = std::thread::scope(|s| {
+            let hs: Vec<_> = inserted
+                .iter()
+                .map(|mine| {
+                    let t = &t;
+                    s.spawn(move || {
+                        let mut r = Vec::with_capacity(mine.len());
+                        for (k, &i) in mine.iter().enumerate() {
+                            if let Some(&j) = mine.get(k + 8) {
+                                t.prefetch_parent(j as usize);
+                            }
+                            r.push(t.find(i as usize) as u32);
+                        }
+                        r
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        if prof {
+            eprintln!("  links: roots done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
         std::thread::scope(|s| {
-            for mine in &inserted {
+            for (mine, r) in inserted.iter().zip(&roots) {
                 let t = &t;
                 s.spawn(move || {
-                    for (k, &i) in mine.iter().enumerate() {
-                        if let Some(&j) = mine.get(k + 8) {
+                    for (k, (&i, &root)) in mine.iter().zip(r).enumerate() {
+                        if let (Some(&j), Some(&rj)) = (mine.get(k + 8), r.get(k + 8)) {
                             t.prefetch_parent(j as usize);
+                            t.prefetch_parent(rj as usize);
                         }
-                        let r = t.find(i as usize);
-                        let name = t.slots[r][0].load(Relaxed);
-                        t.slots[i as usize][1].store(name, Relaxed);
+                        // a root's own second word is still 0 here: only non-roots were ever written
+                        let name = t.slots[root as usize][0].load(Relaxed);
+                        if i != root {
+                            t.slots[i as usize][1].store(name, Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        // the roots last: nothing reads a parent any more
+        std::thread::scope(|s| {
+            for (mine, r) in inserted.iter().zip(&roots) {
+                let t = &t;
+                s.spawn(move || {
+                    for (&i, &root) in mine.iter().zip(r) {
+                        if i == root {
+                            t.slots[i as usize][1].store(t.slots[i as usize][0].load(Relaxed), Relaxed);
+                        }
                     }
                 });
             }

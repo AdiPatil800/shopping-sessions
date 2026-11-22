@@ -246,6 +246,10 @@ struct Chunk {
     end: usize,
 }
 
+fn envu0(k: &str) -> Option<usize> {
+    std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())
+}
+
 fn make_chunks(maps: &[sys::Mapped], first: usize, kind: u8, size: usize, out: &mut Vec<Chunk>) {
     for (i, m) in maps.iter().enumerate() {
         let b = m.bytes();
@@ -590,10 +594,15 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     let ck_bytes: usize = maps[nev..nev + nck].iter().map(|m| m.len).sum();
     // --- links
     let mut lchunks = Vec::new();
-    make_chunks(&maps[nev + nck..], nev + nck, 2, 256 << 10, &mut lchunks);
+    // small chunks: a chunk's index stays in the cache while its rows are read
+    let lsize = envu0("LCHUNK").unwrap_or(32 << 10);
+    make_chunks(&maps[nev + nck..], nev + nck, 2, lsize, &mut lchunks);
     let next = AtomicUsize::new(0);
+    let ln_bytes: usize = maps[nev + nck..].iter().map(|m| m.len).sum();
     let pairs: Vec<Vec<(u64, u64, u64, u64)>> = run_threads(nthreads, |_| {
-        let mut v = Vec::new();
+        // room for every pair there can be (a line is at least 4 bytes; pages
+        // never written cost nothing), so the vector is never moved
+        let mut v = Vec::with_capacity(if std::env::var("LNORES").is_ok() { 0 } else { ln_bytes / 4 + 16 });
         let mut ix = scan2::Index::new();
         loop {
             let k = next.fetch_add(1, Relaxed);
