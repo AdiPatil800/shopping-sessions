@@ -88,7 +88,7 @@ impl<T: Copy> Streams<T> {
         let size = std::mem::size_of::<T>();
         let per = BB / size;
         let full = ((per * size) & (BB - 1)) as u32;
-        Streams { pos: vec![full; n], blocks: (0..n).map(|_| Vec::new()).collect(), base: arena.base() as usize, per, full, _t: std::marker::PhantomData }
+        Streams { pos: vec![full; n], blocks: (0..n).map(|_| Vec::with_capacity(32)).collect(), base: arena.base() as usize, per, full, _t: std::marker::PhantomData }
     }
     #[cold]
     #[inline(never)]

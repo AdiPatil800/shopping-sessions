@@ -692,6 +692,8 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &order, &ud_dir, t));
     }
     let results: Vec<(Vec<[i64; 4]>, usize)> = run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &order, &ud_dir, t));
+    #[cfg(feature = "prof")]
+    eprintln!("  walk Mcycles (all threads): flush_day packed {} clicks {} flush_day slow {}", WALKT[0].load(Relaxed) / 1_000_000, WALKT[1].load(Relaxed) / 1_000_000, WALKT[2].load(Relaxed) / 1_000_000);
     log("sessionized");
 
     let mut camp_tot = vec![[0i64; 4]; (ncamp + 1) * nd];
@@ -1159,6 +1161,7 @@ struct UdWriter {
     defs: Vec<u8>,
     n: usize,
     total: usize,
+    wt: f64, // seconds spent handing row groups to the file
 }
 
 const GROUP_ROWS: usize = 1 << 16;
@@ -1181,6 +1184,7 @@ impl UdWriter {
             defs: vec![0; GROUP_ROWS / 8 + 8],
             n: 0,
             total: 0,
+            wt: 0.0,
         }
     }
     #[inline(always)]
@@ -1194,6 +1198,9 @@ impl UdWriter {
                 *p.add(12) = ninth;
                 self.uid.set_len(self.uid.len() + 4 + len);
             }
+        } else if person & SLOW_BIT != 0 {
+            // a long ID: its bytes come straight from the input file
+            put_str(&mut self.uid, unsafe { ids::loc_bytes(nloc) });
         } else {
             let mut tmp = Vec::new();
             ids::id_bytes(person, nloc, &mut tmp);
@@ -1224,6 +1231,7 @@ impl UdWriter {
             let f = std::fs::File::create(&self.path).expect("create user_daily part");
             self.w = Some(parquet::Writer::new(f, parquet::USER_DAILY).unwrap());
         }
+        let wt0 = Instant::now();
         self.w
             .as_mut()
             .unwrap()
@@ -1239,6 +1247,7 @@ impl UdWriter {
                 ],
             )
             .unwrap();
+        self.wt += wt0.elapsed().as_secs_f64();
         self.total += n;
         self.n = 0;
         self.uid.clear();
@@ -1412,8 +1421,11 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         tm[0] += (q1 - q0).as_secs_f64();
         tm[1] += q1.elapsed().as_secs_f64();
     }
+    let wt = out.wt;
+    let tfin = Instant::now();
     let total = out.finish();
     if prof() {
+        eprintln!("  sess thread: writes {:.1} ms, finish {:.1} ms", wt * 1e3, tfin.elapsed().as_secs_f64() * 1e3);
         eprintln!("  sess thread: scatter {:.1} persons {:.1} ms | Mcycles bins {} sessions {} clicks {} walk {} | persons {} sessions {} clicks {}", tm[0] * 1e3, tm[1] * 1e3, sc.tsc[0] / 1_000_000, sc.tsc[1] / 1_000_000, sc.tsc[2] / 1_000_000, sc.tsc[3] / 1_000_000, sc.tsc[4], sc.tsc[5], sc.tsc[6]);
     }
     let merged: Vec<[i64; 4]> = sc.camp.iter().zip(&sc.asst).map(|(c, &a)| [c[0] & 0xFFFF_FFFF, c[0] >> 32, c[1], a as i64]).collect();
@@ -1422,6 +1434,19 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
 
 #[inline(always)]
 fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, out: &mut UdWriter) {
+    // A hashed person key needs its bytes for the output: seen with an event
+    // of this partition, or else it is a linked ID. They are far away, in the
+    // input file: ask for them now, they are wanted when the first day is written.
+    let nloc = if person & SLOW_BIT != 0 {
+        let l = match sc.nmap.get(person) {
+            Some(l) => l,
+            None => ctx.person.name_loc(person).expect("name of a linked person"),
+        };
+        prefetch_line(unsafe { ids::loc_bytes(l) }.as_ptr());
+        l
+    } else {
+        0
+    };
     #[cfg(feature = "prof")]
     {
         let t0 = tsc();
@@ -1431,7 +1456,7 @@ fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, o
         let t2 = tsc();
         person_clicks(person, cks, sc);
         let t3 = tsc();
-        person_walk(ctx, person, sc, out);
+        person_walk(ctx, person, nloc, sc, out);
         let t4 = tsc();
         sc.tsc[0] += t1 - t0;
         sc.tsc[1] += t2 - t1;
@@ -1447,7 +1472,7 @@ fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, o
         let (lo_w, hi_w) = person_bins(evs, sc);
         person_sessions(ctx, lo_w, hi_w, sc);
         person_clicks(person, cks, sc);
-        person_walk(ctx, person, sc, out);
+        person_walk(ctx, person, nloc, sc, out);
     }
 }
 
@@ -1550,9 +1575,12 @@ fn person_clicks(person: u64, cks: &[CR], sc: &mut Scratch) {
     }
 }
 
+#[cfg(feature = "prof")]
+static WALKT: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
+fn person_walk(ctx: &Ctx, person: u64, nloc: u64, sc: &mut Scratch, out: &mut UdWriter) {
     let nd = ctx.nd;
     let cl = &sc.clk;
     let has_clicks = !cl.is_empty();
@@ -1560,25 +1588,23 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
     let nsess = sc.sess.len() as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut cur = sc.sess[0].di;
-    // a hashed person key needs its bytes: seen with an event of this
-    // partition, or else it is a linked ID
-    let nloc = if person & SLOW_BIT != 0 {
-        match sc.nmap.get(person) {
-            Some(l) => l,
-            None => ctx.person.name_loc(person).expect("name of a linked person"),
-        }
-    } else {
-        0
-    };
     let (mut d_sessions, mut d_events, mut d_rev, mut d_pur) = (0u32, 0u32, 0i64, 0u32);
     // A campaign is "active" while one of its clicks is within the 7 days before
     // the current session. `since[c]` is the first session it assisted that is
     // not yet counted; counts are settled when the day changes, when the
     // campaign drops out, and at the end.
+    #[cfg(feature = "prof")]
+    let mut tw = [0u64; 3];
     for ord in 0..nsess {
         let s = sc.sess[ord as usize];
         if s.di != cur {
+            #[cfg(feature = "prof")]
+            let q = tsc();
             flush_day(ctx, person, nloc, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+            #[cfg(feature = "prof")]
+            {
+                tw[0] += tsc() - q;
+            }
             for &c in &sc.active {
                 let c = c as usize;
                 sc.asst[c * nd + cur as usize] += ord - sc.since[c];
@@ -1596,6 +1622,8 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
         d_pur += s.purchases;
         let di = s.di as usize;
         let mut credited = organic;
+        #[cfg(feature = "prof")]
+        let q = tsc();
         if has_clicks {
             while hi < cl.len() && cl[hi].0 <= s.start {
                 let c = cl[hi].1 as usize;
@@ -1635,11 +1663,31 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
                 credited = cl[best].1 as usize;
             }
         }
+        #[cfg(feature = "prof")]
+        let q2 = tsc();
         let a = &mut sc.camp[credited * nd + di];
         a[0] += 1 + (((s.purchases > 0) as i64) << 32);
         a[1] += s.rev;
+        #[cfg(feature = "prof")]
+        {
+            tw[1] += q2 - q;
+            tw[2] += tsc() - q2;
+        }
     }
+    #[cfg(feature = "prof")]
+    let q = tsc();
     flush_day(ctx, person, nloc, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+    #[cfg(feature = "prof")]
+    {
+        tw[0] += tsc() - q;
+        sc.tsc[7] += tw[0];
+        if person & SLOW_BIT != 0 {
+            WALKT[2].fetch_add(tw[0], Relaxed);
+        } else {
+            WALKT[0].fetch_add(tw[0], Relaxed);
+        }
+        WALKT[1].fetch_add(tw[1], Relaxed);
+    }
     for i in 0..sc.active.len() {
         let c = sc.active[i] as usize;
         sc.asst[c * nd + cur as usize] += nsess - sc.since[c];
