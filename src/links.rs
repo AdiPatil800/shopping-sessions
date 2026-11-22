@@ -301,24 +301,9 @@ impl PersonTable {
                             t.prefetch_parent(j as usize);
                             t.prefetch_parent(rj as usize);
                         }
-                        // a root's own second word is still 0 here: only non-roots were ever written
+                        // nobody reads a parent any more: roots get their own key
                         let name = t.slots[root as usize][0].load(Relaxed);
-                        if i != root {
-                            t.slots[i as usize][1].store(name, Relaxed);
-                        }
-                    }
-                });
-            }
-        });
-        // the roots last: nothing reads a parent any more
-        std::thread::scope(|s| {
-            for (mine, r) in inserted.iter().zip(&roots) {
-                let t = &t;
-                s.spawn(move || {
-                    for (&i, &root) in mine.iter().zip(r) {
-                        if i == root {
-                            t.slots[i as usize][1].store(t.slots[i as usize][0].load(Relaxed), Relaxed);
-                        }
+                        t.slots[i as usize][1].store(name, Relaxed);
                     }
                 });
             }

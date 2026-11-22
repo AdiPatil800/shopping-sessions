@@ -1039,10 +1039,10 @@ fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena, pp
 
 fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
     let mut b1: Vec<u64> = Vec::new();
-    let mut b2: Vec<u64> = Vec::new();
     let mut table: Vec<(u64, u32, u32, u32)> = Vec::new();
     let mut sus: Vec<(u64, u32, u32, u32)> = Vec::new();
     let mut killed = 0usize;
+    let mut dtm = [0f64; 3];
     let kill = |t: u32, loc: u32| {
         if loc != NONE {
             unsafe { (*(parsed[t as usize].arena.base() as *mut ER).add(loc as usize)).pay = DEAD };
@@ -1057,29 +1057,31 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
         if n == 0 {
             continue;
         }
+        // Two bits a slot in one bitmap, "seen" and "seen again": one word
+        // read and written per record.
         let mbits = (usize::BITS - (n * 16).leading_zeros()).max(10);
-        let words = 1usize << (mbits - 6);
+        let words = 1usize << (mbits - 5);
         b1.clear();
         b1.resize(words, 0);
-        b2.clear();
-        b2.resize(words, 0);
         let sh = 64 - mbits;
         let mut suspects = 0usize;
+        let d0 = Instant::now();
         for th in parsed {
             th.ss.for_slices_ahead(bkt, |sl| {
                 for r in sl {
                     let i = (r.ek.wrapping_mul(K2) >> sh) as usize;
-                    let (w, m) = (i >> 6, 1u64 << (i & 63));
+                    let (w, m) = (i >> 5, 1u64 << (2 * (i & 31)));
                     unsafe {
                         let x = *b1.get_unchecked(w);
-                        let hit = (x & m != 0) as u64;
-                        *b1.get_unchecked_mut(w) = x | m;
-                        *b2.get_unchecked_mut(w) |= m & hit.wrapping_neg();
-                        suspects += hit as usize;
+                        let seen = x & m;
+                        *b1.get_unchecked_mut(w) = x | m | (seen << 1);
+                        suspects += (seen != 0) as usize;
                     }
                 }
             });
         }
+        let d1 = Instant::now();
+        dtm[0] += (d1 - d0).as_secs_f64();
         if suspects == 0 {
             continue;
         }
@@ -1091,7 +1093,7 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
             th.ss.for_slices(bkt, |sl| {
                 for r in sl {
                     let i = (r.ek.wrapping_mul(K2) >> sh) as usize;
-                    let bit = (unsafe { *b2.get_unchecked(i >> 6) } >> (i & 63)) & 1;
+                    let bit = (unsafe { *b1.get_unchecked(i >> 5) } >> (2 * (i & 31) + 1)) & 1;
                     unsafe { sus.as_mut_ptr().add(ns).write((r.ek, r.ingest, r.loc, t as u32)) };
                     ns += bit as usize;
                 }
@@ -1107,6 +1109,8 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
                 }
             }
         }
+        let d2 = Instant::now();
+        dtm[1] += (d2 - d1).as_secs_f64();
         let cap = (ns * 2).next_power_of_two().max(16);
         let tshift = 64 - cap.trailing_zeros();
         let mask = cap - 1;
@@ -1133,6 +1137,10 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
                 j = (j + 1) & mask;
             }
         }
+        dtm[2] += d2.elapsed().as_secs_f64();
+    }
+    if prof() {
+        eprintln!("  dedup thread: first pass {:.1} suspects {:.1} table {:.1} ms", dtm[0] * 1e3, dtm[1] * 1e3, dtm[2] * 1e3);
     }
     killed
 }
