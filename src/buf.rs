@@ -64,6 +64,7 @@ impl Arena {
 }
 
 pub static AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub static READ_AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static AHEAD_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
 /// Bytes in a stream block.
@@ -130,6 +131,29 @@ impl<T: Copy> Streams<T> {
         match self.blocks[s].last() {
             None => 0,
             Some(&last) => (self.blocks[s].len() - 1) * self.per + self.tail(s, last),
+        }
+    }
+    /// `for_slices` for a first pass over blocks that are not in the cache:
+    /// asks for the whole next block while working on the current one.
+    #[inline(always)]
+    pub fn for_slices_ahead(&self, s: usize, mut f: impl FnMut(&[T])) {
+        let on = cfg!(feature = "selfbench") && READ_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
+        let bl = &self.blocks[s];
+        let n = bl.len();
+        for (k, &b) in bl.iter().enumerate() {
+            if on && k + 1 < n {
+                let nx = (self.base + bl[k + 1] as usize) as *const u8;
+                for l in 0..BB / 64 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(nx.add(l * 64) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let _ = (nx, l);
+                }
+            }
+            let len = if k + 1 == n { self.tail(s, b) } else { self.per };
+            f(unsafe { std::slice::from_raw_parts((self.base + b as usize) as *const T, len) });
         }
     }
     /// Calls `f` on each block's filled part of stream `s`.

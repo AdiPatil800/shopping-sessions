@@ -1055,7 +1055,7 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
         let sh = 64 - mbits;
         let mut suspects = 0usize;
         for th in parsed {
-            th.ss.for_slices(bkt, |sl| {
+            th.ss.for_slices_ahead(bkt, |sl| {
                 for r in sl {
                     let i = (r.ek.wrapping_mul(K2) >> sh) as usize;
                     let (w, m) = (i >> 6, 1u64 << (i & 63));
@@ -1087,6 +1087,15 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
             });
         }
         unsafe { sus.set_len(ns) };
+        // The losing copies are marked dead where they lie, all over the
+        // arenas: ask for those lines before the loop that decides.
+        if cfg!(feature = "selfbench") && KILL_PF.load(Relaxed) {
+            for &(_, _, loc, t) in sus.iter() {
+                if loc != NONE {
+                    prefetch_line(unsafe { (parsed[t as usize].arena.base() as *const ER).add(loc as usize) });
+                }
+            }
+        }
         let cap = (ns * 2).next_power_of_two().max(16);
         let tshift = 64 - cap.trailing_zeros();
         let mask = cap - 1;
@@ -1311,7 +1320,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         ecount.clear();
         ecount.resize(nsub + 1, 0);
         for t in parsed {
-            t.es.for_slices(p, |sl| {
+            t.es.for_slices_ahead(p, |sl| {
                 for e in sl {
                     ecount[sub(e.person) + 1] += (e.pay != DEAD) as u32;
                 }
@@ -1739,6 +1748,19 @@ fn tile_ids(buf: &mut [u8], k: usize) {
 /// 60M and 20M events, for several partition counts; then the parse phase on
 /// fresh file mappings against anonymous copies. Returns text rows.
 static DEC_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static KILL_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[inline(always)]
+fn prefetch_line<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags));
+    }
+}
 #[cfg(feature = "selfbench")]
 static PREFAULT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "selfbench")]
@@ -1793,7 +1815,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
     let bdir = out_dir.join("_bench");
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
-    let runs: [(&str, usize, u32, u32); 3] = [("Sa", small, 0, 0), ("Sb", small, 0, 0), ("Sa3", small, 0, 0)];
+    // S: as shipped; N: no request for the lines of dead copies; R: N plus reading blocks ahead; Q: shipped plus reading ahead
+    let runs: [(&str, usize, u32, u32); 9] = [("Sa", small, 0, 0), ("Na", small, 0, 0), ("Ra", small, 0, 0), ("Qa", small, 0, 0), ("Sb", small, 0, 0), ("Nb", small, 0, 0), ("Rb", small, 0, 0), ("Qb", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1810,6 +1833,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
+        KILL_PF.store(!(label.starts_with('N') || label.starts_with('R')), Relaxed);
+        buf::READ_AHEAD.store(label.starts_with('R') || label.starts_with('Q'), Relaxed);
         let t = Instant::now();
         let marks: std::sync::Mutex<([(u16, f64); 16], usize)> = std::sync::Mutex::new(([(0, 0.0); 16], 0));
         let d2 = data.to_path_buf();
@@ -1821,6 +1846,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 g.1 = n + 1;
             }
         });
+        KILL_PF.store(true, Relaxed);
+        buf::READ_AHEAD.store(false, Relaxed);
         let keep = label == "Sa3";
         if keep {
             last = Some(c);
