@@ -265,7 +265,10 @@ fn run_threads<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..n).map(|t| {
             let f = &f;
-            s.spawn(move || f(t))
+            s.spawn(move || {
+                sys::pin(t);
+                f(t)
+            })
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
@@ -563,6 +566,7 @@ fn main() {
     log(&t0, &format!("mapped {} event files {} B, {} click files {} B, {} link files", nev, ev_bytes, nck, ck_bytes, ln_files.len()));
 
     dirs.join().unwrap();
+    sys::PIN.store(std::env::var("PIN").is_ok(), Relaxed);
     let unmap = std::env::var("KEEP_MAPS").is_err() && !cfg!(feature = "selfbench");
     let ctx = pipeline(&maps, &files, nev, nck, ws, we, move || lookups.join().unwrap(), &out, nthreads, unmap, &|w: &str| log(&t0, w));
     #[cfg(feature = "selfbench")]
@@ -1783,7 +1787,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
     let bdir = out_dir.join("_bench");
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
-    let runs: [(&str, usize, u32, u32); 2] = [("Sa", small, 0, 0), ("Sa3", small, 0, 0)];
+    let runs: [(&str, usize, u32, u32); 7] = [("Sa", small, 0, 0), ("Pa", small, 0, 0), ("Sb", small, 0, 0), ("Pb", small, 0, 0), ("Sc", small, 0, 0), ("Pc", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1800,6 +1804,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
+        sys::PIN.store(label.starts_with('P'), Relaxed);
         let t = Instant::now();
         let marks: std::sync::Mutex<([(u16, f64); 16], usize)> = std::sync::Mutex::new(([(0, 0.0); 16], 0));
         let d2 = data.to_path_buf();
@@ -1811,6 +1816,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 g.1 = n + 1;
             }
         });
+        sys::PIN.store(false, Relaxed);
         let keep = label == "Sa3";
         if keep {
             last = Some(c);
