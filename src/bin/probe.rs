@@ -88,7 +88,7 @@ fn main() {
     // Page-cache residency before touching anything.
     let mut resident = 0u64;
     let mut pages = 0u64;
-    let maps: Vec<sys::Mapped> = all.iter().map(|f| sys::Mapped::open(&f.0, false).unwrap()).collect();
+    let maps: Vec<sys::Mapped> = all.iter().map(|f| sys::Mapped::open(&f.0, false).unwrap().0).collect();
     eprintln!("mmap of {} files took {:?}", maps.len(), t0.elapsed());
     for m in &maps {
         if m.len == 0 {

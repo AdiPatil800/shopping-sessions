@@ -33,6 +33,22 @@ fn intern(bytes: &[u8]) -> u64 {
     SLOW_BIT | i as u64
 }
 
+/// Drops the top bit of each byte: 8 bytes become 56 bits.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn compress7(x: u64) -> u64 {
+    unsafe { std::arch::x86_64::_pext_u64(x, 0x7F7F_7F7F_7F7F_7F7F) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+#[inline(always)]
+fn compress7(mut x: u64) -> u64 {
+    x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
+    x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
+    x = ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF);
+    x
+}
+
 /// The key of a non-empty ID. Reads up to 9 bytes from `p` when `len <= 9`,
 /// and 8 bytes even when `len < 8`: the caller guarantees 8 readable bytes.
 #[inline(always)]
@@ -48,11 +64,7 @@ pub unsafe fn id_key(p: *const u8, len: usize) -> u64 {
         let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
         let ninth_zero = (len == 9) & (ninth == 0);
         if (high | zero) == 0 && !ninth_zero {
-            let mut x = lo.swap_bytes();
-            x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
-            x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
-            x = ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF);
-            return (x << 7) | ninth;
+            return (compress7(lo.swap_bytes()) << 7) | ninth;
         }
     }
     intern(std::slice::from_raw_parts(p, len))
@@ -104,5 +116,42 @@ pub fn cmp_key(a: u64, b: u64) -> Ordering {
         a.cmp(&b)
     } else {
         cmp_slow(a, b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_round_trip_and_keep_order() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabets: [&[u8]; 3] = [b"0123456789abcdefghijklmnopqrstuvwxyz", b"abAB01 \t\x01\x7f", b"ab\x00\x80\xff\xc3\xa9z"];
+        let mut all: Vec<(Vec<u8>, u64)> = Vec::new();
+        for i in 0..200_000 {
+            let al = alphabets[(i % 3) as usize];
+            let len = 1 + (rnd() % 12) as usize;
+            let s: Vec<u8> = (0..len).map(|_| al[(rnd() % al.len() as u64) as usize]).collect();
+            let k = id_key_slice(&s);
+            let mut padded = s.clone();
+            padded.extend_from_slice(&[0xAA; 16]);
+            let k2 = if s.len() <= 9 { unsafe { id_key(padded.as_ptr(), s.len()) } } else { k };
+            assert_eq!(k, k2);
+            let mut back = Vec::new();
+            key_bytes(k, &mut back);
+            assert_eq!(back, s);
+            all.push((s, k));
+        }
+        for w in all.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            assert_eq!(a.0 == b.0, a.1 == b.1);
+            assert_eq!(cmp_key(a.1, b.1), a.0.cmp(&b.0), "{:?} {:?}", a.0, b.0);
+        }
     }
 }

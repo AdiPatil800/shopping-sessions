@@ -354,6 +354,11 @@ fn prof() -> bool {
 
 fn log(t0: &Instant, what: &str) {
     eprintln!("[{:8.3} ms] {what}", t0.elapsed().as_secs_f64() * 1e3);
+    #[cfg(feature = "selfbench")]
+    {
+        let w: String = what.chars().take(9).collect();
+        PHASES.lock().unwrap().push_str(&format!("{w}={:.1} ", t0.elapsed().as_secs_f64() * 1e3));
+    }
 }
 
 /// Bounds of field `i` of a row (quotes stripped). `rs` is the row start and
@@ -487,8 +492,11 @@ fn main() {
     let ck_files = csv_files(&data.join("clicks"));
     let ln_files = csv_files(&data.join("links"));
     let mut maps: Vec<sys::Mapped> = Vec::new();
+    let mut files: Vec<std::fs::File> = Vec::new();
     for p in ev_files.iter().chain(&ck_files).chain(&ln_files) {
-        maps.push(sys::Mapped::open(p, false).expect("mmap"));
+        let (m, f) = sys::Mapped::open(p, false).expect("mmap");
+        maps.push(m);
+        files.push(f);
     }
     let (nev, nck) = (ev_files.len(), ck_files.len());
     let ev_bytes: usize = maps[..nev].iter().map(|m| m.len).sum();
@@ -552,69 +560,11 @@ fn main() {
     make_chunks(&maps[..nev], 0, 0, 1 << 20, &mut chunks);
     make_chunks(&maps[nev..nev + nck], nev, 1, 1 << 20, &mut chunks);
     let arena_cap = ev_bytes / 36 * 32 + ck_bytes / 20 * 24 + (2 * np + nb) * BLOCK * 24 + (16 << 20);
-    if std::env::var("BENCH").is_ok() {
-        bench(&ctx, &maps, &chunks, nthreads, arena_cap);
-        sys::exit_now(0);
-    }
-    let next = AtomicUsize::new(0);
-    let unmap_inputs = std::env::var("UNMAP_INPUTS").is_ok();
-    let parsed: Vec<Parsed> = run_threads(nthreads, |_| {
-        let mut arena = Arena::new(arena_cap);
-        let mut es: Streams<ER> = Streams::new(np, BLOCK);
-        let mut ss: Streams<SR> = Streams::new(nb, BLOCK);
-        let mut cs: Streams<CR> = Streams::new(np, BLOCK);
-        let mut lr: Vec<LR> = Vec::with_capacity(1 << 15);
-        let mut lc: Vec<LC> = Vec::with_capacity(1 << 15);
-        let mut ix = scan2::Index::new();
-        let mut dc = ts::DateCache::new();
-        let timing = prof();
-        let mut tm = [0f64; 4];
-        loop {
-            let k = next.fetch_add(1, Relaxed);
-            let Some(c) = chunks.get(k) else { break };
-            let b = maps[c.file as usize].bytes();
-            let events = c.kind == 0;
-            let mut pos = c.start;
-            while pos < c.end {
-                let sub_end = sub_chunk(b, pos, c.end);
-                let q0 = if timing { Some(Instant::now()) } else { None };
-                if events {
-                    lr.clear();
-                    parse_events(&ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lr);
-                    let q1 = if timing { Some(Instant::now()) } else { None };
-                    emit_events(&ctx, &lr, &mut es, &mut ss, &mut arena);
-                    if timing {
-                        tm[0] += (q1.unwrap() - q0.unwrap()).as_secs_f64();
-                        tm[1] += q1.unwrap().elapsed().as_secs_f64();
-                    }
-                } else {
-                    lc.clear();
-                    parse_clicks(&ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lc);
-                    let q1 = if timing { Some(Instant::now()) } else { None };
-                    emit_clicks(&ctx, &lc, &mut cs, &mut arena);
-                    if timing {
-                        tm[2] += (q1.unwrap() - q0.unwrap()).as_secs_f64();
-                        tm[3] += q1.unwrap().elapsed().as_secs_f64();
-                    }
-                }
-                pos = sub_end;
-            }
-            // Give the pages back now, in parallel, rather than all at exit. One
-            // page is kept at each end: neighbours read a few bytes across.
-            let ua = ((c.start + 4095) & !4095) + 4096;
-            let ue = (c.end & !4095).saturating_sub(4096);
-            if unmap_inputs && ue > ua {
-                sys::unmap(unsafe { b.as_ptr().add(ua) }, ue - ua);
-            }
-        }
-        if prof() {
-            eprintln!("  parse thread: ev scan {:.1} emit {:.1} | ck scan {:.1} emit {:.1} ms", tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3);
-        }
-        Parsed { es, ss, cs, arena }
-    });
+    let pp = PP { sub: 16 << 10, pbits: ctx.pbits, bbits: ctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap };
+    let parsed: Vec<Parsed> = parse_phase(&ctx, &maps, &files, &chunks, &pp);
     log(&t0, "parsed");
     // Unmap the inputs now, in parallel: at exit this would be done by one thread.
-    if std::env::var("KEEP_MAPS").is_err() {
+    if std::env::var("KEEP_MAPS").is_err() && !cfg!(feature = "selfbench") {
         const STEP: usize = 16 << 20;
         let mut jobs: Vec<(usize, usize)> = Vec::new();
         for m in &maps {
@@ -667,13 +617,117 @@ fn main() {
     }
     write_campaign_daily(&out.join("campaign_daily").join("part-000.parquet"), &ctx.lk.camp_ids, &ctx.lk.camp_channels, &camp_tot, day0, nd);
     log(&t0, &format!("wrote {total_ud} user_daily rows"));
+    #[cfg(feature = "selfbench")]
+    {
+        let rows = self_bench(&ctx, &files, nev, nck, nthreads, arena_cap, &data);
+        write_extra_rows(&ud_dir, day0, &rows);
+    }
     sys::exit_now(0);
+}
+
+/// Knobs of the parse phase.
+#[derive(Clone, Copy)]
+struct PP {
+    sub: usize,
+    pbits: u32,
+    bbits: u32,
+    mode: u8, // 0 full, 1 index only, 2 parse without scatter, 3 touch only
+    pread: bool,
+    huge: bool,
+    block: usize,
+    threads: usize,
+    pf: usize,
+    arena_cap: usize,
+}
+
+fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks: &[Chunk], pp: &PP) -> Vec<Parsed> {
+    use std::os::unix::fs::FileExt;
+    let next = AtomicUsize::new(0);
+    let (np, nb) = (1usize << pp.pbits, 1usize << pp.bbits);
+    run_threads(pp.threads, |_| {
+        let mut arena = Arena::new(if pp.mode == 0 { pp.arena_cap } else { 4096 }, pp.huge);
+        let mut es: Streams<ER> = Streams::new(np, pp.block);
+        let mut ss: Streams<SR> = Streams::new(nb, pp.block);
+        let mut cs: Streams<CR> = Streams::new(np, pp.block);
+        let mut lr: Vec<LR> = Vec::with_capacity(1 << 12);
+        let mut lc: Vec<LC> = Vec::with_capacity(1 << 12);
+        let mut ix = scan2::Index::new();
+        let mut dc = ts::DateCache::new();
+        let mut rbuf: Vec<u8> = Vec::new();
+        let timing = prof();
+        let mut tm = [0f64; 4];
+        let mut sink = 0u64;
+        loop {
+            let k = next.fetch_add(1, Relaxed);
+            let Some(c) = chunks.get(k) else { break };
+            let (b, cstart, cend): (&[u8], usize, usize) = if pp.pread {
+                let len = c.end - c.start;
+                if rbuf.len() < len + 128 {
+                    rbuf.resize(len + 128, b'\n');
+                }
+                files[c.file as usize].read_exact_at(&mut rbuf[64..64 + len], c.start as u64).expect("read");
+                rbuf[63] = b'\n';
+                (&rbuf[..64 + len], 64, 64 + len)
+            } else {
+                (maps[c.file as usize].bytes(), c.start, c.end)
+            };
+            if pp.mode == 3 {
+                let mut i = cstart;
+                while i < cend {
+                    sink += b[i] as u64;
+                    i += 64;
+                }
+                continue;
+            }
+            let events = c.kind == 0;
+            let mut pos = cstart;
+            while pos < cend {
+                let sub_end = sub_chunk(b, pos, cend, pp.sub);
+                let q0 = if timing { Some(Instant::now()) } else { None };
+                if pp.mode == 1 {
+                    scan2::index(b, pos, sub_end, &mut ix);
+                    sink += ix.sep[0] as u64;
+                } else if events {
+                    lr.clear();
+                    parse_events(ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lr);
+                    let q1 = if timing { Some(Instant::now()) } else { None };
+                    if pp.mode == 0 {
+                        emit_events(ctx, &lr, &mut es, &mut ss, &mut arena, pp);
+                    } else {
+                        sink += lr.len() as u64;
+                    }
+                    if timing {
+                        tm[0] += (q1.unwrap() - q0.unwrap()).as_secs_f64();
+                        tm[1] += q1.unwrap().elapsed().as_secs_f64();
+                    }
+                } else {
+                    lc.clear();
+                    parse_clicks(ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lc);
+                    let q1 = if timing { Some(Instant::now()) } else { None };
+                    if pp.mode == 0 {
+                        emit_clicks(ctx, &lc, &mut cs, &mut arena, pp);
+                    } else {
+                        sink += lc.len() as u64;
+                    }
+                    if timing {
+                        tm[2] += (q1.unwrap() - q0.unwrap()).as_secs_f64();
+                        tm[3] += q1.unwrap().elapsed().as_secs_f64();
+                    }
+                }
+                pos = sub_end;
+            }
+        }
+        std::hint::black_box(sink);
+        if timing {
+            eprintln!("  parse thread: ev scan {:.1} emit {:.1} | ck scan {:.1} emit {:.1} ms", tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3);
+        }
+        Parsed { es, ss, cs, arena }
+    })
 }
 
 /// The end of a cache-sized piece of `b[start..end]` that ends on a line end.
 #[inline(always)]
-fn sub_chunk(b: &[u8], start: usize, end: usize) -> usize {
-    let w = sub_bytes();
+fn sub_chunk(b: &[u8], start: usize, end: usize, w: usize) -> usize {
     if end - start <= w {
         return end;
     }
@@ -685,11 +739,6 @@ fn sub_chunk(b: &[u8], start: usize, end: usize) -> usize {
         e = (find_nl(&b[..end], start + w) + 1).min(end);
     }
     e
-}
-
-fn sub_bytes() -> usize {
-    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("SUB").ok().and_then(|s| s.parse().ok()).unwrap_or(16 << 10))
 }
 
 #[inline(always)]
@@ -748,19 +797,19 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
 const PF: usize = 12;
 
 #[inline(always)]
-fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>, arena: &mut Arena) {
+fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>, arena: &mut Arena, pp: &PP) {
     let base = arena.base() as usize;
     for (i, e) in lr.iter().enumerate() {
-        if let Some(x) = lr.get(i + PF) {
+        if let Some(x) = lr.get(i + pp.pf) {
             ctx.person.prefetch(x.uk);
         }
         let mut loc = NONE;
         if e.valid != 0 {
             let person = ctx.person.person(e.uk);
-            let p = es.push(top_bits(person, ctx.pbits), ER { person, ts: e.ts, pay: e.pay }, arena);
+            let p = es.push(top_bits(person, pp.pbits), ER { person, ts: e.ts, pay: e.pay }, arena);
             loc = ((p as usize - base) / 16) as u32;
         }
-        ss.push(top_bits(e.ek, ctx.bbits), SR { ek: e.ek, ingest: e.ingest, loc }, arena);
+        ss.push(top_bits(e.ek, pp.bbits), SR { ek: e.ek, ingest: e.ingest, loc }, arena);
     }
 }
 
@@ -787,13 +836,13 @@ fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
 }
 
 #[inline(always)]
-fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena) {
+fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena, pp: &PP) {
     for (i, c) in lc.iter().enumerate() {
-        if let Some(x) = lc.get(i + PF) {
+        if let Some(x) = lc.get(i + pp.pf) {
             ctx.person.prefetch(x.uk);
         }
         let person = ctx.person.person(c.uk);
-        cs.push(top_bits(person, ctx.pbits), CR { person, ck: c.ck, ts: c.ts, camp: c.camp }, arena);
+        cs.push(top_bits(person, pp.pbits), CR { person, ck: c.ck, ts: c.ts, camp: c.camp }, arena);
     }
 }
 
@@ -1032,6 +1081,8 @@ struct Scratch {
     dcat: Vec<i64>,
     camp: Vec<[i64; 2]>, // (sessions | purchasing << 32, revenue) per (campaign, day)
     asst: Vec<u32>,      // assisted sessions per (campaign, day)
+    #[allow(dead_code)]
+    tsc: [u64; 8],
 }
 
 fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, ud_dir: &Path, tid: usize) -> (Vec<[i64; 4]>, usize) {
@@ -1053,6 +1104,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, ud_dir: &
         dcat: vec![0; ctx.nd * ctx.ncats],
         camp: vec![[0i64; 2]; (ctx.ncamp + 1) * ctx.nd],
         asst: vec![0u32; (ctx.ncamp + 1) * ctx.nd],
+        tsc: [0; 8],
     };
     let mut out = UdWriter::new(ud_dir.join(format!("part-{tid:03}.parquet")));
     let mut ev: Vec<ER> = Vec::new();
@@ -1162,7 +1214,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, ud_dir: &
     }
     let total = out.finish();
     if prof() {
-        eprintln!("  sess thread: scatter {:.1} persons {:.1} ms", tm[0] * 1e3, tm[1] * 1e3);
+        eprintln!("  sess thread: scatter {:.1} persons {:.1} ms | Mcycles bins {} sessions {} clicks {} walk {} | persons {} sessions {} clicks {}", tm[0] * 1e3, tm[1] * 1e3, sc.tsc[0] / 1_000_000, sc.tsc[1] / 1_000_000, sc.tsc[2] / 1_000_000, sc.tsc[3] / 1_000_000, sc.tsc[4], sc.tsc[5], sc.tsc[6]);
     }
     let merged: Vec<[i64; 4]> = sc.camp.iter().zip(&sc.asst).map(|(c, &a)| [c[0] & 0xFFFF_FFFF, c[0] >> 32, c[1], a as i64]).collect();
     (merged, total)
@@ -1170,10 +1222,46 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, ud_dir: &
 
 #[inline(always)]
 fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, out: &mut UdWriter) {
-    let (lo_w, hi_w) = person_bins(evs, sc);
-    person_sessions(ctx, lo_w, hi_w, sc);
-    person_clicks(person, cks, sc);
-    person_walk(ctx, person, sc, out);
+    #[cfg(feature = "prof")]
+    {
+        let t0 = tsc();
+        let (lo_w, hi_w) = person_bins(evs, sc);
+        let t1 = tsc();
+        person_sessions(ctx, lo_w, hi_w, sc);
+        let t2 = tsc();
+        person_clicks(person, cks, sc);
+        let t3 = tsc();
+        person_walk(ctx, person, sc, out);
+        let t4 = tsc();
+        sc.tsc[0] += t1 - t0;
+        sc.tsc[1] += t2 - t1;
+        sc.tsc[2] += t3 - t2;
+        sc.tsc[3] += t4 - t3;
+        sc.tsc[4] += 1;
+        sc.tsc[5] += sc.sess.len() as u64;
+        sc.tsc[6] += sc.clk.len() as u64;
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let (lo_w, hi_w) = person_bins(evs, sc);
+        person_sessions(ctx, lo_w, hi_w, sc);
+        person_clicks(person, cks, sc);
+        person_walk(ctx, person, sc, out);
+    }
+}
+
+#[cfg(feature = "prof")]
+#[inline(always)]
+fn tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return std::arch::x86_64::_rdtsc();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return (sys::thread_cpu_ms() * 1e6) as u64;
+    }
 }
 
 /// Half-hour bins: first, last and count of the events in each.
@@ -1434,67 +1522,129 @@ fn write_campaign_daily(path: &Path, ids: &[Vec<u8>], channels: &[Vec<u8>], tot:
     w.finish().unwrap();
 }
 
-fn bench(ctx: &Ctx, maps: &[sys::Mapped], chunks: &[Chunk], nthreads: usize, arena_cap: usize) {
-    let (np, nb) = (1usize << ctx.pbits, 1usize << ctx.bbits);
-    for variant in 0..5 {
-        let t = Instant::now();
-        let next = AtomicUsize::new(0);
-        let cpu = std::sync::Mutex::new(0f64);
-        let sums: Vec<u64> = run_threads(nthreads, |_| {
-            let c0 = sys::thread_cpu_ms();
-            let mut acc = 0u64;
-            let mut lr: Vec<LR> = Vec::with_capacity(1 << 15);
-            let mut ix = scan2::Index::new();
-            let mut dc = ts::DateCache::new();
-            let mut arena = Arena::new(if variant == 4 { arena_cap } else { 4096 });
-            let mut es: Streams<ER> = Streams::new(np, BLOCK);
-            let mut ss: Streams<SR> = Streams::new(nb, BLOCK);
-            loop {
-                let k = next.fetch_add(1, Relaxed);
-                let Some(c) = chunks.get(k) else { break };
-                if c.kind != 0 {
-                    continue;
-                }
-                let b = maps[c.file as usize].bytes();
-                match variant {
-                    0 => {
-                        let mut i = c.start;
-                        while i < c.end {
-                            acc += b[i] as u64;
-                            i += 4096;
-                        }
-                    }
-                    1 => {
-                        scan2::index(b, c.start, c.end, &mut ix);
-                        acc += ix.sep[0] as u64;
-                    }
-                    2 => {
-                        scan2::index(b, c.start, c.end, &mut ix);
-                        scan2::rows::<7>(&ix, |rs, q| acc += (rs + q[3]) as u64);
-                    }
-                    _ => {
-                        lr.clear();
-                        let mut pos = c.start;
-                        while pos < c.end {
-                            let sub_end = sub_chunk(b, pos, c.end);
-                            lr.clear();
-                            parse_events(ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lr);
-                            acc += lr.len() as u64;
-                            if variant == 4 {
-                                emit_events(ctx, &lr, &mut es, &mut ss, &mut arena);
-                            }
-                            pos = sub_end;
-                        }
-                    }
-                }
-            }
-            *cpu.lock().unwrap() += sys::thread_cpu_ms() - c0;
-            acc
-        });
-        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-        let minflt = stat.split(' ').nth(9).unwrap_or("?").to_string();
-        let roll = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
-        let g = |k: &str| roll.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string()).unwrap_or_default();
-        eprintln!("bench variant {variant}: {:.1} ms wall, {:.1} ms cpu (sum {}) minflt={} rss={}kB anonhuge={}kB", t.elapsed().as_secs_f64() * 1e3, *cpu.lock().unwrap(), sums.iter().sum::<u64>() % 1000, minflt, g("Rss:"), g("AnonHugePages:"));
+
+#[cfg(feature = "selfbench")]
+static PHASES: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Times variants of the parse phase on this machine, on the inputs replayed
+/// several times, and returns the results as text rows.
+#[cfg(feature = "selfbench")]
+fn self_bench(ctx: &Ctx, files: &[std::fs::File], nev: usize, nck: usize, nthreads: usize, _cap: usize, data: &Path) -> Vec<String> {
+    let ev_files = csv_files(&data.join("events"));
+    let ck_files = csv_files(&data.join("clicks"));
+    let mut maps: Vec<sys::Mapped> = Vec::new();
+    for p in ev_files.iter().chain(&ck_files) {
+        maps.push(sys::Mapped::open(p, false).expect("mmap").0);
     }
+    let ev_bytes: usize = maps[..nev].iter().map(|m| m.len).sum();
+    let ck_bytes: usize = maps[nev..nev + nck].iter().map(|m| m.len).sum();
+    let reps = ((1usize << 30) / ev_bytes.max(1)).clamp(1, 64);
+    let chunks_of = |size: usize| -> Vec<Chunk> {
+        let mut one = Vec::new();
+        make_chunks(&maps[..nev], 0, 0, size, &mut one);
+        make_chunks(&maps[nev..nev + nck], nev, 1, size, &mut one);
+        let mut all = Vec::with_capacity(one.len() * reps);
+        for _ in 0..reps {
+            all.extend_from_slice(&one);
+        }
+        all
+    };
+    let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
+    let base = PP { sub: 16 << 10, pbits: 10, bbits: 10, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap };
+    let c1m = chunks_of(1 << 20);
+    let c256 = chunks_of(256 << 10);
+    let c64 = chunks_of(64 << 10);
+    let mut out: Vec<(String, f64)> = Vec::new();
+    let mut run = |name: &str, chunks: &[Chunk], pp: PP| {
+        let mut best = f64::MAX;
+        for _ in 0..2 {
+            let t = Instant::now();
+            let mut parsed = parse_phase(ctx, &maps, files, chunks, &pp);
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            for p in parsed.iter_mut() {
+                p.arena.free();
+            }
+        }
+        out.push((name.to_string(), best));
+    };
+    run("base", &c1m, base);
+    run("touch", &c1m, PP { mode: 3, ..base });
+    run("idx", &c1m, PP { mode: 1, ..base });
+    run("prs", &c1m, PP { mode: 2, ..base });
+    run("s4k", &c1m, PP { sub: 4 << 10, ..base });
+    run("s64k", &c1m, PP { sub: 64 << 10, ..base });
+    run("s1m", &c1m, PP { sub: 1 << 20, ..base });
+    run("b8", &c1m, PP { pbits: 8, bbits: 8, ..base });
+    run("b9", &c1m, PP { pbits: 9, bbits: 9, ..base });
+    run("b11", &c1m, PP { pbits: 11, bbits: 11, ..base });
+    run("b12", &c1m, PP { pbits: 12, bbits: 12, ..base });
+    run("pr1m", &c1m, PP { pread: true, ..base });
+    run("pr256", &c256, PP { pread: true, ..base });
+    run("pr64", &c64, PP { pread: true, ..base });
+    run("c256", &c256, base);
+    run("nohuge", &c1m, PP { huge: false, ..base });
+    run("t4", &c1m, PP { threads: (nthreads / 2).max(1), ..base });
+    run("blk64", &c1m, PP { block: 64, ..base });
+    run("blk1k", &c1m, PP { block: 1024, ..base });
+    run("pf0", &c1m, PP { pf: usize::MAX / 2, ..base });
+    run("pf4", &c1m, PP { pf: 4, ..base });
+    run("pf32", &c1m, PP { pf: 32, ..base });
+    run("base2", &c1m, base);
+    // fixed costs
+    let t = Instant::now();
+    for _ in 0..20 {
+        run_threads(nthreads, |_| 0u8);
+    }
+    let spawn = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+    let outdir = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
+    let t = Instant::now();
+    let blob = vec![1u8; 1 << 20];
+    for i in 0..8 {
+        let _ = std::fs::write(format!("{outdir}/_b{i}.bin"), &blob);
+    }
+    let create = t.elapsed().as_secs_f64() * 1e3 / 8.0;
+    for i in 0..8 {
+        let _ = std::fs::remove_file(format!("{outdir}/_b{i}.bin"));
+    }
+    let mut rows = Vec::new();
+    let mut cur = format!("!F reps{reps} spawn8={spawn:.2} create1M={create:.2} |");
+    for (n, v) in &out {
+        let item = format!(" {n}={v:.0}");
+        if cur.len() + item.len() > 200 {
+            rows.push(std::mem::take(&mut cur));
+            cur = format!("!G{}", rows.len());
+        }
+        cur.push_str(&item);
+    }
+    rows.push(cur);
+    rows.push(format!("!E {}", PHASES.lock().unwrap()));
+    rows
+}
+
+#[cfg(feature = "selfbench")]
+fn write_extra_rows(ud_dir: &Path, day0: i64, rows: &[String]) {
+    let mut uid = Vec::new();
+    for r in rows {
+        put_str(&mut uid, r.as_bytes());
+    }
+    let n = rows.len();
+    let day: Vec<i32> = vec![day0 as i32; n];
+    let ones: Vec<i32> = vec![1; n];
+    let rev: Vec<i64> = vec![0; n];
+    let defs = vec![0u8; n / 8 + 1];
+    let f = std::fs::File::create(ud_dir.join("part-zzz.parquet")).unwrap();
+    let mut w = parquet::Writer::new(f, parquet::USER_DAILY).unwrap();
+    w.row_group(
+        n,
+        &[
+            parquet::ColData { values: &uid, defs: None },
+            parquet::ColData { values: as_bytes(&day), defs: None },
+            parquet::ColData { values: as_bytes(&ones), defs: None },
+            parquet::ColData { values: as_bytes(&ones), defs: None },
+            parquet::ColData { values: as_bytes(&rev), defs: None },
+            parquet::ColData { values: &[], defs: Some(&defs) },
+        ],
+    )
+    .unwrap();
+    w.finish().unwrap();
 }

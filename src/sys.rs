@@ -45,18 +45,18 @@ unsafe impl Send for Mapped {}
 unsafe impl Sync for Mapped {}
 
 impl Mapped {
-    pub fn open(path: &std::path::Path, populate: bool) -> std::io::Result<Mapped> {
+    pub fn open(path: &std::path::Path, populate: bool) -> std::io::Result<(Mapped, File)> {
         let f = File::open(path)?;
         let len = f.metadata()?.len() as usize;
         if len == 0 {
-            return Ok(Mapped { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+            return Ok((Mapped { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 }, f));
         }
         let flags = MAP_PRIVATE | if populate { MAP_POPULATE } else { 0 };
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, flags, f.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Mapped { ptr: p, len })
+        Ok((Mapped { ptr: p, len }, f))
     }
     #[inline]
     pub fn bytes(&self) -> &[u8] {

@@ -14,9 +14,18 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-    pub fn new(cap: usize) -> Arena {
+    pub fn new(cap: usize, huge: bool) -> Arena {
         let cap = (cap + (2 << 20)) & !((2 << 20) - 1);
-        Arena { base: sys::anon(cap, true) as usize, used: 0, cap }
+        Arena { base: sys::anon(cap, huge) as usize, used: 0, cap }
+    }
+    /// Gives the memory back. Nothing may point into the arena any more.
+    #[allow(dead_code)]
+    pub fn free(&mut self) {
+        if self.cap > 0 {
+            sys::unmap(self.base as *const u8, self.cap);
+            self.cap = 0;
+            self.used = 0;
+        }
     }
     #[inline]
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
