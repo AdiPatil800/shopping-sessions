@@ -29,6 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
+#[global_allocator]
+static ALLOC: sys::Bump = sys::Bump;
+
 const K1: u64 = 0x9E37_79B9_7F4A_7C15;
 const K2: u64 = 0xD6E8_FEB8_6659_FD93;
 const DAY: i64 = 86_400_000;
@@ -456,6 +459,40 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+    // --- manifest
+    let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
+    let mval = |key: &str| -> i64 {
+        let i = manifest.find(&format!("\"{key}\"")).expect(key) + key.len() + 2;
+        let rest = &manifest[i..];
+        let a = rest.find('"').unwrap() + 1;
+        let b = a + rest[a..].find('"').unwrap();
+        ts::parse_ts_slice(rest[a..b].as_bytes()).expect("manifest timestamp")
+    };
+    if prof() {
+        log(&t0, "manifest read");
+    }
+    let ws = mval("window_start");
+    let we = mval("window_end");
+    let base = ws - WEEK;
+    assert!(we > ws && we - base < (1i64 << 32) - 1, "window too long");
+
+    // --- map every input file
+    let ev_files = csv_files(&data.join("events"));
+    let ck_files = csv_files(&data.join("clicks"));
+    let ln_files = csv_files(&data.join("links"));
+    if prof() {
+        log(&t0, "listed");
+    }
+    let mut maps: Vec<sys::Mapped> = Vec::new();
+    let mut files: Vec<std::fs::File> = Vec::new();
+    for p in ev_files.iter().chain(&ck_files).chain(&ln_files) {
+        let (m, f) = sys::Mapped::open(p, false).expect("mmap");
+        maps.push(m);
+        files.push(f);
+    }
+    let (nev, nck) = (ev_files.len(), ck_files.len());
+    // The helper threads start only now: their page faults would make every
+    // mmap call above wait for the address-space lock.
     let lookups = {
         let data = data.clone();
         std::thread::spawn(move || {
@@ -471,32 +508,6 @@ fn main() {
         })
     };
 
-    // --- manifest
-    let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
-    let mval = |key: &str| -> i64 {
-        let i = manifest.find(&format!("\"{key}\"")).expect(key) + key.len() + 2;
-        let rest = &manifest[i..];
-        let a = rest.find('"').unwrap() + 1;
-        let b = a + rest[a..].find('"').unwrap();
-        ts::parse_ts_slice(rest[a..b].as_bytes()).expect("manifest timestamp")
-    };
-    let ws = mval("window_start");
-    let we = mval("window_end");
-    let base = ws - WEEK;
-    assert!(we > ws && we - base < (1i64 << 32) - 1, "window too long");
-
-    // --- map every input file
-    let ev_files = csv_files(&data.join("events"));
-    let ck_files = csv_files(&data.join("clicks"));
-    let ln_files = csv_files(&data.join("links"));
-    let mut maps: Vec<sys::Mapped> = Vec::new();
-    let mut files: Vec<std::fs::File> = Vec::new();
-    for p in ev_files.iter().chain(&ck_files).chain(&ln_files) {
-        let (m, f) = sys::Mapped::open(p, false).expect("mmap");
-        maps.push(m);
-        files.push(f);
-    }
-    let (nev, nck) = (ev_files.len(), ck_files.len());
     let ev_bytes: usize = maps[..nev].iter().map(|m| m.len).sum();
     let ck_bytes: usize = maps[nev..nev + nck].iter().map(|m| m.len).sum();
     log(&t0, &format!("mapped {} event files {} B, {} click files {} B, {} link files", nev, ev_bytes, nck, ck_bytes, ln_files.len()));
@@ -554,7 +565,10 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     let (ncats, ncamp) = (lk.cat_names.len(), lk.camp_ids.len());
 
     let est_rows = ev_bytes / 76 + 1;
+    let envu = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     let bits = (usize::BITS - (est_rows / 40_000).leading_zeros()).clamp(6, 11);
+    let pbits = envu("PBITS").or(envu("BITS")).map(|v| v as u32).unwrap_or(bits);
+    let bbits = envu("BBITS").or(envu("BITS")).map(|v| v as u32).unwrap_or(bits);
     let ctx = Ctx {
         base,
         base_s: base.div_euclid(1000),
@@ -568,23 +582,36 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         ncats,
         ncamp,
         person,
-        pbits: bits,
-        bbits: bits,
+        pbits,
+        bbits,
     };
     let (np, nb) = (1usize << ctx.pbits, 1usize << ctx.bbits);
     log(&format!("lookups joined: {} cats, {} campaigns; {} partitions", ncats, ncamp, np));
 
     // --- parse events and clicks
     let mut chunks = Vec::new();
-    make_chunks(&maps[..nev], 0, 0, 1 << 20, &mut chunks);
-    make_chunks(&maps[nev..nev + nck], nev, 1, 1 << 20, &mut chunks);
+    let csize = envu("CHUNK").unwrap_or(1 << 20);
+    make_chunks(&maps[..nev], 0, 0, csize, &mut chunks);
+    make_chunks(&maps[nev..nev + nck], nev, 1, csize, &mut chunks);
     let arena_cap = ev_bytes / 36 * 32 + ck_bytes / 20 * 24 + (2 * np + nb) * BLOCK * 24 + (16 << 20);
-    let pp = PP { sub: 16 << 10, pbits: ctx.pbits, bbits: ctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap };
+    let pp = PP {
+        sub: envu("SUB").unwrap_or(16 << 10),
+        pbits: ctx.pbits,
+        bbits: ctx.bbits,
+        mode: envu("MODE").unwrap_or(0) as u8,
+        pread: envu("PREAD").is_some() && !files.is_empty(),
+        huge: envu("NOHUGE").is_none(),
+        block: envu("BLK").unwrap_or(BLOCK),
+        threads: nthreads,
+        pf: envu("PFD").unwrap_or(PF),
+        arena_cap,
+    };
     let parsed: Vec<Parsed> = parse_phase(&ctx, maps, files, &chunks, &pp);
     log("parsed");
     // Unmap the inputs now, in parallel: at exit this would be done by one thread.
-    if unmap {
+    if unmap && !pp.pread {
         const STEP: usize = 16 << 20;
+        let drop_only = std::env::var("MUNMAP").is_err();
         let mut jobs: Vec<(usize, usize)> = Vec::new();
         for m in maps {
             let len = (m.len + 4095) & !4095;
@@ -599,7 +626,11 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         run_threads(nthreads, |_| loop {
             let k = next.fetch_add(1, Relaxed);
             let Some(&(p, n)) = jobs.get(k) else { break };
-            sys::unmap(p as *const u8, n);
+            if drop_only {
+                sys::drop_pages(p as *const u8, n);
+            } else {
+                sys::unmap(p as *const u8, n);
+            }
         });
         log("inputs unmapped");
     }
@@ -612,12 +643,16 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     // --- sessionize per person partition, writing user_daily as we go
     let next = AtomicUsize::new(0);
     let ud_dir = out.join("user_daily");
+    // biggest partitions first: a heavy one picked last would leave the other threads idle
+    let mut order: Vec<(usize, u32)> = (0..np).map(|p| (parsed.iter().map(|t| t.es.len(p) + t.cs.len(p)).sum::<usize>(), p as u32)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let order: Vec<u32> = order.into_iter().map(|x| x.1).collect();
     let loops: usize = std::env::var("LOOP").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     for _ in 0..loops {
         let next = AtomicUsize::new(0);
-        run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &ud_dir, t));
+        run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &order, &ud_dir, t));
     }
-    let results: Vec<(Vec<[i64; 4]>, usize)> = run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &ud_dir, t));
+    let results: Vec<(Vec<[i64; 4]>, usize)> = run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &order, &ud_dir, t));
     log("sessionized");
 
     let mut camp_tot = vec![[0i64; 4]; (ncamp + 1) * nd];
@@ -1098,7 +1133,7 @@ struct Scratch {
     tsc: [u64; 8],
 }
 
-fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, ud_dir: &Path, tid: usize) -> (Vec<[i64; 4]>, usize) {
+fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[u32], ud_dir: &Path, tid: usize) -> (Vec<[i64; 4]>, usize) {
     let np = 1usize << ctx.pbits;
     let mut sc = Scratch {
         bits: vec![0; ctx.nbins / 64 + 2],
@@ -1125,10 +1160,11 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, ud_dir: &
     let (mut ecount, mut ccount, mut pos) = (Vec::<u32>::new(), Vec::<u32>::new(), Vec::<u32>::new());
     let mut tm = [0f64; 2];
     loop {
-        let p = next.fetch_add(1, Relaxed);
-        if p >= np {
+        let k = next.fetch_add(1, Relaxed);
+        if k >= np {
             break;
         }
+        let p = order[k] as usize;
         let q0 = Instant::now();
         let n_all: usize = parsed.iter().map(|t| t.es.len(p)).sum();
         if n_all == 0 {

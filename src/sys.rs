@@ -109,3 +109,93 @@ pub fn thread_cpu_ms() -> f64 {
     unsafe { clock_gettime(clk, &mut ts) };
     ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 * 1e-6
 }
+
+pub const MADV_DONTNEED: i32 = 4;
+
+/// Drops the page-table entries of `[addr, addr + len)` (page-aligned). Unlike
+/// munmap this only needs the address-space lock shared, so threads can do it
+/// side by side.
+pub fn drop_pages(addr: *const u8, len: usize) {
+    unsafe { madvise(addr as *mut u8, len, MADV_DONTNEED) };
+}
+
+// ---------------------------------------------------------------------------
+// The global allocator: a lock-free bump pointer over one lazily committed
+// reservation. Nothing is ever freed (the process is short-lived), so there is
+// no lock to fight over and no mmap/munmap churn from worker threads.
+
+use std::alloc::{GlobalAlloc, Layout};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+pub struct Bump;
+
+static BUMP_BASE: AtomicUsize = AtomicUsize::new(0);
+static BUMP_NEXT: AtomicUsize = AtomicUsize::new(0);
+const BUMP_CAP: usize = 24 << 30;
+
+#[cold]
+#[inline(never)]
+fn bump_init() -> usize {
+    let p = unsafe { mmap(std::ptr::null_mut(), BUMP_CAP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
+    if p as isize == -1 {
+        exit_now(5);
+    }
+    if cfg!(target_os = "linux") {
+        unsafe { madvise(p, BUMP_CAP, MADV_HUGEPAGE) };
+    }
+    match BUMP_BASE.compare_exchange(0, p as usize, Relaxed, Relaxed) {
+        Ok(_) => p as usize,
+        Err(winner) => {
+            unsafe { munmap(p, BUMP_CAP) };
+            winner
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for Bump {
+    #[inline]
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let mut base = BUMP_BASE.load(Relaxed);
+        if base == 0 {
+            base = bump_init();
+        }
+        let align = l.align().max(16);
+        let mut cur = BUMP_NEXT.load(Relaxed);
+        loop {
+            let start = (cur + align - 1) & !(align - 1);
+            let end = start + l.size();
+            if end > BUMP_CAP {
+                return std::ptr::null_mut();
+            }
+            match BUMP_NEXT.compare_exchange_weak(cur, end, Relaxed, Relaxed) {
+                Ok(_) => return (base + start) as *mut u8,
+                Err(x) => cur = x,
+            }
+        }
+    }
+    #[inline]
+    unsafe fn dealloc(&self, _p: *mut u8, _l: Layout) {}
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        // fresh pages of the reservation are zero and never handed out twice
+        self.alloc(l)
+    }
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+        if new_size <= l.size() {
+            return p;
+        }
+        // grow in place when this is the newest block
+        let base = BUMP_BASE.load(Relaxed);
+        let off = p as usize - base;
+        let old_end = off + l.size();
+        if off + new_size <= BUMP_CAP && BUMP_NEXT.compare_exchange(old_end, off + new_size, Relaxed, Relaxed).is_ok() {
+            return p;
+        }
+        let n = self.alloc(Layout::from_size_align_unchecked(new_size, l.align()));
+        if !n.is_null() {
+            std::ptr::copy_nonoverlapping(p, n, l.size());
+        }
+        n
+    }
+}

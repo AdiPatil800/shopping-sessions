@@ -303,6 +303,9 @@ pub unsafe fn parse_ts_cached(p: *const u8, len: usize, c: &mut DateCache) -> Op
         }
         return parse_ts(p, len);
     }
+    if len == 13 {
+        return digits16(p.add(13), 13);
+    }
     if len >= 1 && len <= 16 {
         return digits16(p.add(len), len);
     }
