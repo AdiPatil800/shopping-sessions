@@ -735,7 +735,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         log("released");
     }
     #[cfg(feature = "selfbench")]
-    {
+    if !FRESH.load(Relaxed) {
         let mut parsed = parsed;
         for p in parsed.iter_mut() {
             p.arena.free();
@@ -1830,6 +1830,9 @@ fn tile_ids(buf: &mut [u8], k: usize) {
 /// Times the whole pipeline on the inputs tiled with distinct IDs, at about
 /// 60M and 20M events, for several partition counts; then the parse phase on
 /// fresh file mappings against anonymous copies. Returns text rows.
+/// Benchmark: keep everything a run allocated, so the next run gets memory this process never had.
+#[cfg(feature = "selfbench")]
+static FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DEC_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static KILL_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -1899,8 +1902,11 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
     // S: as shipped; N: no request for the lines of dead copies; R: N plus reading blocks ahead; Q: shipped plus reading ahead
-    // S: as shipped; V: the links table not touched up front
-    let runs: [(&str, usize, u32, u32); 9] = [("Sa", small, 0, 0), ("Va", small, 0, 0), ("Sb", small, 0, 0), ("Vb", small, 0, 0), ("Sc", small, 0, 0), ("Vc", small, 0, 0), ("Sd", small, 0, 0), ("Vd", small, 0, 0), ("Sa3", small, 0, 0)];
+    // Nothing is given back between these runs, so each gets memory new to
+    // the process, as a scored run does. H: huge pages everywhere (as shipped);
+    // A: ordinary pages for the record arenas; N: ordinary pages everywhere.
+    // The last three runs recycle memory as before.
+    let runs: [(&str, usize, u32, u32); 10] = [("H1", small, 0, 0), ("A1", small, 0, 0), ("N1", small, 0, 0), ("H2", small, 0, 0), ("A2", small, 0, 0), ("N2", small, 0, 0), ("H3", small, 0, 0), ("Sa", small, 0, 0), ("Sb", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1917,7 +1923,17 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
-        links::TOUCH.store(label.as_bytes()[0] != b'V', Relaxed);
+        let kind = label.as_bytes()[0];
+        FRESH.store(kind != b'S', Relaxed);
+        unsafe {
+            if kind == b'A' || kind == b'N' {
+                std::env::set_var("NOHUGE", "1");
+            } else {
+                std::env::remove_var("NOHUGE");
+            }
+        }
+        sys::HUGE_OK.store(kind != b'N', Relaxed);
+        sys::bump_huge(kind != b'N');
         KILL_PF.store(false, Relaxed);
         buf::READ_AHEAD.store(label.starts_with('R') || label.starts_with('Q'), Relaxed);
         let t = Instant::now();
@@ -1944,9 +1960,11 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         let at = |a: u8, b: u8| m[..n].iter().rev().find(|x| x.0 == (a as u16) << 8 | b as u16).map(|x| x.1).unwrap_or(0.0);
         let (lo, pa, de, se, wr) = (at(b'l', b'o'), at(b'p', b'a'), at(b'd', b'e'), at(b's', b'e'), at(b'w', b'r'));
         std::mem::forget(tiled);
-        if !keep {
+        if !keep && !FRESH.load(Relaxed) {
             sys::bump_reset(mark);
         }
+        sys::HUGE_OK.store(true, Relaxed);
+        sys::bump_huge(true);
         let (lp, lb) = (at(b'l', b'i'), 0.0);
         let _ = lb;
         out.push((format!("{label}:{:.0}/{:.0}/{:.0}/{:.0}", lo, pa - lo, de - pa, se - de), lp));
