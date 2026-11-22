@@ -1,88 +1,88 @@
-//! Append-only record streams built from fixed-size blocks carved out of a
-//! per-thread arena of (transparent huge page) anonymous memory. Pushing never
-//! moves data, so a record's (stream, index) stays valid.
+//! Append-only record streams built from fixed-size blocks carved out of one
+//! per-thread arena (a single lazily committed reservation), so a record is
+//! addressable by a 32-bit index into its thread's arena.
 
 use crate::sys;
 
-pub const BLOCK: usize = 1024; // records per block
-
 pub struct Arena {
-    cur: usize,
-    end: usize,
-    chunk: usize,
+    base: usize,
+    used: usize,
+    cap: usize,
 }
 
 unsafe impl Send for Arena {}
+unsafe impl Sync for Arena {}
 
 impl Arena {
-    pub fn new(chunk: usize) -> Arena {
-        Arena { cur: 0, end: 0, chunk: chunk.max(4 << 20) }
+    pub fn new(cap: usize) -> Arena {
+        let cap = (cap + (2 << 20)) & !((2 << 20) - 1);
+        Arena { base: sys::anon(cap, true) as usize, used: 0, cap }
     }
     #[inline]
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
         let bytes = (bytes + 63) & !63;
-        if self.cur + bytes > self.end {
-            let size = self.chunk.max(bytes);
-            let p = sys::anon(size, true) as usize;
-            self.cur = p;
-            self.end = p + size;
+        if self.used + bytes > self.cap {
+            eprintln!("arena exhausted ({} bytes)", self.cap);
+            sys::exit_now(4);
         }
-        let p = self.cur;
-        self.cur += bytes;
+        let p = self.base + self.used;
+        self.used += bytes;
         p as *mut u8
+    }
+    #[inline(always)]
+    pub fn base(&self) -> *mut u8 {
+        self.base as *mut u8
     }
 }
 
-pub struct Stream<T> {
-    pub blocks: Vec<*mut T>,
-    cur: *mut T,
-    end: *mut T,
+/// `n` streams of `T`, each a list of blocks of `block` records.
+pub struct Streams<T> {
+    hot: Vec<(*mut T, *mut T)>, // (next slot, end of block)
+    blocks: Vec<Vec<*mut T>>,
+    block: usize,
 }
 
-unsafe impl<T> Send for Stream<T> {}
-unsafe impl<T> Sync for Stream<T> {}
+unsafe impl<T> Send for Streams<T> {}
+unsafe impl<T> Sync for Streams<T> {}
 
-impl<T: Copy> Stream<T> {
-    pub fn new() -> Self {
-        Stream { blocks: Vec::new(), cur: std::ptr::null_mut(), end: std::ptr::null_mut() }
+impl<T: Copy> Streams<T> {
+    pub fn new(n: usize, block: usize) -> Self {
+        Streams { hot: vec![(std::ptr::null_mut(), std::ptr::null_mut()); n], blocks: (0..n).map(|_| Vec::new()).collect(), block }
     }
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, arena: &mut Arena) {
-        let b = arena.alloc(BLOCK * std::mem::size_of::<T>()) as *mut T;
-        self.blocks.push(b);
-        self.cur = b;
-        self.end = unsafe { b.add(BLOCK) };
+    fn grow(&mut self, s: usize, arena: &mut Arena) {
+        let b = arena.alloc(self.block * std::mem::size_of::<T>()) as *mut T;
+        self.blocks[s].push(b);
+        self.hot[s] = (b, unsafe { b.add(self.block) });
     }
-    /// Appends and returns the record's index.
+    /// Appends to stream `s`; returns where the record went.
     #[inline(always)]
-    pub fn push(&mut self, v: T, arena: &mut Arena) -> usize {
-        if self.cur == self.end {
-            self.grow(arena);
-        }
+    pub fn push(&mut self, s: usize, v: T, arena: &mut Arena) -> *mut T {
         unsafe {
-            self.cur.write(v);
-            self.cur = self.cur.add(1);
+            if self.hot.get_unchecked(s).0 == self.hot.get_unchecked(s).1 {
+                self.grow(s, arena);
+            }
+            let h = self.hot.get_unchecked_mut(s);
+            let p = h.0;
+            p.write(v);
+            h.0 = p.add(1);
+            p
         }
-        self.len() - 1
     }
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        match self.blocks.last() {
+    pub fn len(&self, s: usize) -> usize {
+        match self.blocks[s].last() {
             None => 0,
-            Some(&last) => (self.blocks.len() - 1) * BLOCK + (unsafe { self.cur.offset_from(last) }) as usize,
+            Some(&last) => (self.blocks[s].len() - 1) * self.block + (unsafe { self.hot[s].0.offset_from(last) }) as usize,
         }
     }
+    /// Calls `f` on each block's filled part of stream `s`.
     #[inline(always)]
-    pub fn ptr(&self, i: usize) -> *mut T {
-        unsafe { self.blocks.get_unchecked(i / BLOCK).add(i % BLOCK) }
-    }
-    /// Calls `f` on each block's filled part.
-    #[inline(always)]
-    pub fn for_slices(&self, mut f: impl FnMut(&[T])) {
-        let n = self.blocks.len();
-        for (k, &b) in self.blocks.iter().enumerate() {
-            let len = if k + 1 == n { (unsafe { self.cur.offset_from(b) }) as usize } else { BLOCK };
+    pub fn for_slices(&self, s: usize, mut f: impl FnMut(&[T])) {
+        let bl = &self.blocks[s];
+        let n = bl.len();
+        for (k, &b) in bl.iter().enumerate() {
+            let len = if k + 1 == n { (unsafe { self.hot[s].0.offset_from(b) }) as usize } else { self.block };
             f(unsafe { std::slice::from_raw_parts(b, len) });
         }
     }

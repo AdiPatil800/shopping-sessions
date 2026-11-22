@@ -131,3 +131,142 @@ pub fn fields<const N: usize>(buf: &[u8], ls: usize, le: usize, commas: &[usize;
     }
     qc == 2 * nq
 }
+
+#[inline(always)]
+fn below(x: usize) -> u128 {
+    if x >= 128 {
+        !0u128
+    } else {
+        (1u128 << x) - 1
+    }
+}
+
+/// Calls `f(fields)` for every well-formed line with exactly N fields in
+/// `buf[start..end]`, with quotes already stripped. Malformed lines are skipped.
+#[inline(always)]
+pub fn scan_records<const N: usize>(buf: &[u8], start: usize, end: usize, mut f: impl FnMut(&[(usize, usize); N])) {
+    let len = buf.len();
+    let base = buf.as_ptr();
+    let load = |p: usize| -> (u64, u64, u64) {
+        if p >= end {
+            return (0, 0, 0);
+        }
+        let (a, b, c) = unsafe {
+            if p + 64 <= len {
+                masks(base.add(p))
+            } else {
+                let mut tail = [0u8; 64];
+                tail[..len - p].copy_from_slice(&buf[p..]);
+                masks(tail.as_ptr())
+            }
+        };
+        let v = if end - p >= 64 { !0u64 } else { (1u64 << (end - p)) - 1 };
+        (a & v, b & v, c & v)
+    };
+    let mut p = start;
+    let mut b0 = load(p);
+    let mut b1 = load(p + 64);
+    let mut b2 = load(p + 128);
+    let mut cur = 0usize;
+    let mut out = [(0usize, 0usize); N];
+    loop {
+        while cur >= 64 {
+            p += 64;
+            cur -= 64;
+            b0 = b1;
+            b1 = b2;
+            b2 = load(p + 128);
+        }
+        let ls = p + cur;
+        if ls >= end {
+            break;
+        }
+        let c0 = cur;
+        let win = move |x0: u64, x1: u64, x2: u64| -> u128 {
+            let w = ((x0 as u128) | ((x1 as u128) << 64)) >> c0;
+            if c0 == 0 {
+                w
+            } else {
+                w | ((x2 as u128) << (128 - c0))
+            }
+        };
+        let wn = win(b0.0, b1.0, b2.0);
+        let le = if wn != 0 {
+            wn.trailing_zeros() as usize
+        } else if end - ls <= 128 {
+            end - ls
+        } else {
+            // A line longer than the window: scalar path.
+            let mut e = ls;
+            while e < end && buf[e] != b'\n' {
+                e += 1;
+            }
+            slow_line::<N>(buf, ls, e, &mut out, &mut f);
+            let np = e + 1;
+            p = np;
+            cur = 0;
+            b0 = load(p);
+            b1 = load(p + 64);
+            b2 = load(p + 128);
+            continue;
+        };
+        let lm = below(le);
+        let cb = win(b0.1, b1.1, b2.1) & lm;
+        cur += le + 1;
+        if cb.count_ones() as usize != N - 1 {
+            continue;
+        }
+        let mut bits = cb;
+        out[0].0 = 0;
+        for k in 0..N - 1 {
+            let c = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            out[k].1 = c;
+            out[k + 1].0 = c + 1;
+        }
+        out[N - 1].1 = le;
+        let qb = win(b0.2, b1.2, b2.2) & lm;
+        if qb != 0 {
+            let mut nq = 0u32;
+            let mut ok = true;
+            for fl in out.iter_mut() {
+                let (s, e) = *fl;
+                let qs = ((qb >> s) & 1) as usize;
+                let ei = if e > s { e - 1 } else { e };
+                let qe = ((qb >> ei) & 1) as usize;
+                ok &= qs == qe && (qs == 0 || e - s >= 2);
+                nq += qs as u32;
+                *fl = (s + qs, e - qs);
+            }
+            if !ok || qb.count_ones() != 2 * nq {
+                continue;
+            }
+        }
+        for fl in out.iter_mut() {
+            fl.0 += ls;
+            fl.1 += ls;
+        }
+        f(&out);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn slow_line<const N: usize>(buf: &[u8], ls: usize, le: usize, out: &mut [(usize, usize); N], f: &mut impl FnMut(&[(usize, usize); N])) {
+    let mut commas = [0usize; 8];
+    let mut nc = 0;
+    let mut qc = 0u32;
+    for i in ls..le {
+        if buf[i] == b',' {
+            if nc < 8 {
+                commas[nc] = i;
+            }
+            nc += 1;
+        } else if buf[i] == b'"' {
+            qc += 1;
+        }
+    }
+    if nc == N - 1 && fields::<N>(buf, ls, le, &commas, qc, out) {
+        f(out);
+    }
+}
