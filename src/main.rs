@@ -660,7 +660,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     make_chunks(&maps[nev..nev + nck], nev, 1, csize, &mut chunks);
     let arena_cap = ev_bytes / 36 * 48 + ck_bytes / 20 * 24 + (3 * np + nb) * buf::BB + (16 << 20);
     let pp = PP {
-        sub: envu("SUB").unwrap_or(16 << 10),
+        sub: envu("SUB").unwrap_or(64 << 10), // measured on the scoring machine: 32 to 64 KB is best
         pbits: ctx.pbits,
         bbits: ctx.bbits,
         mode: envu("MODE").unwrap_or(0) as u8,
