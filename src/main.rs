@@ -904,6 +904,7 @@ fn sub_chunk(b: &[u8], start: usize, end: usize, w: usize) -> usize {
 #[inline(always)]
 fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lr: &mut Vec<LR>) {
     scan2::index(b, start, end, ix);
+    lr.reserve((end - start) / 13 + 1);
     let base = unsafe { b.as_ptr().add(start) };
     let (ws_rel, we_rel, cbase, base_s) = (ctx.ws_rel as i64, ctx.we_rel as i64, ctx.base, ctx.base_s);
     scan2::rows::<7>(ix, |rs, q| unsafe {
@@ -915,6 +916,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
         let (p3, l3) = fld!(base, rs, q, 3);
         let ingest_ms = ts_p(p3, l3, dc);
         let ingest = match ingest_ms {
+            Some(ms) if ms >= 0 => ((ms as u64 / 1000) as i64 - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             Some(ms) => (ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             None => u32::MAX,
         };
@@ -956,7 +958,10 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
             e.uloc = locator(p1.offset(adj), l1);
             e.valid = 1;
         }
-        lr.push(e);
+        // room for this was reserved up front: a row is at least 13 bytes
+        let n = lr.len();
+        lr.as_mut_ptr().add(n).write(e);
+        lr.set_len(n + 1);
     });
 }
 
@@ -969,12 +974,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
     let m = if cfg!(feature = "selfbench") { pp.mode } else { 0 };
     let (do_look, do_er, do_sr) = (matches!(m, 0 | 4 | 7), matches!(m, 0 | 5 | 7), matches!(m, 0 | 6));
     let mut sink = 0u64;
-    for (i, e) in lr.iter().enumerate() {
-        if do_look && pp.pf < 4096 {
-            if let Some(x) = lr.get(i + pp.pf) {
-                ctx.person.prefetch(x.uk);
-            }
-        }
+    for e in lr.iter() {
         let mut loc = NONE;
         if e.valid != 0 {
             let person = if do_look { ctx.person.person(e.uk) } else { e.uk };
@@ -1000,6 +1000,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
 #[inline(always)]
 fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lc: &mut Vec<LC>) {
     scan2::index(b, start, end, ix);
+    lc.reserve((end - start) / 8 + 1);
     let base = unsafe { b.as_ptr().add(start) };
     scan2::rows::<4>(ix, |rs, q| unsafe {
         let (p0, l0) = fld!(base, rs, q, 0);
@@ -1017,18 +1018,16 @@ fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
         let Some(camp) = ctx.lk.camp.get(id_key(p2, l2)) else { return };
         let uk = id_key(p1, l1);
         ctx.person.prefetch(uk);
-        lc.push(LC { uk, ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
+        // room for this was reserved up front: a row is at least 8 bytes
+        let n = lc.len();
+        lc.as_mut_ptr().add(n).write(LC { uk, ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
+        lc.set_len(n + 1);
     });
 }
 
 #[inline(always)]
 fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena, pp: &PP) {
-    for (i, c) in lc.iter().enumerate() {
-        if pp.pf < 4096 {
-            if let Some(x) = lc.get(i + pp.pf) {
-                ctx.person.prefetch(x.uk);
-            }
-        }
+    for c in lc.iter() {
         let person = ctx.person.person(c.uk);
         cs.push(top_bits(person, pp.pbits), CR { person, ck: c.ck, ts: c.ts, camp: c.camp }, arena);
     }
