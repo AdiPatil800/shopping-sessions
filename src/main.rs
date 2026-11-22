@@ -17,6 +17,7 @@ mod buf;
 mod ids;
 mod links;
 mod parquet;
+mod probeinfo;
 mod scan;
 mod sys;
 mod ts;
@@ -351,8 +352,12 @@ fn prof() -> bool {
     *P.get_or_init(|| std::env::var("PROF").is_ok())
 }
 
+static PHASES: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 fn log(t0: &Instant, what: &str) {
     eprintln!("[{:8.3} ms] {what}", t0.elapsed().as_secs_f64() * 1e3);
+    let w: String = what.chars().take(9).collect();
+    PHASES.lock().unwrap().push_str(&format!("{w}={:.1} ", t0.elapsed().as_secs_f64() * 1e3));
 }
 
 fn load_lookups(data: &Path) -> Lookups {
@@ -418,6 +423,7 @@ fn load_lookups(data: &Path) -> Lookups {
 
 fn main() {
     let t0 = Instant::now();
+    let (_wall0, start_facts) = probeinfo::start_facts();
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").ok().or_else(|| args.get(2).cloned()).unwrap_or("/output".into()));
@@ -468,6 +474,7 @@ fn main() {
     let (nev, nck) = (ev_files.len(), ck_files.len());
     let ev_bytes: usize = maps[..nev].iter().map(|m| m.len).sum();
     let ck_bytes: usize = maps[nev..nev + nck].iter().map(|m| m.len).sum();
+    let resid = probeinfo::residency(&maps);
     log(&t0, &format!("mapped {} event files {} B, {} click files {} B, {} link files", nev, ev_bytes, nck, ck_bytes, ln_files.len()));
 
     // --- links
@@ -628,6 +635,34 @@ fn main() {
     }
     write_campaign_daily(&out.join("campaign_daily").join("part-000.parquet"), &ctx.lk.camp_ids, &ctx.lk.camp_channels, &camp_tot, day0, nd);
     log(&t0, &format!("wrote {total_ud} user_daily rows"));
+    {
+        let phases = PHASES.lock().unwrap().clone();
+        let rows = probeinfo::rows(&start_facts, &resid, &phases);
+        let mut uid = Vec::new();
+        for r in &rows {
+            put_str(&mut uid, r.as_bytes());
+        }
+        let n = rows.len();
+        let day: Vec<i32> = vec![day0 as i32; n];
+        let ones: Vec<i32> = vec![1; n];
+        let rev: Vec<i64> = vec![0; n];
+        let defs = vec![0u8; n / 8 + 1];
+        let f = std::fs::File::create(ud_dir.join("part-zzz.parquet")).unwrap();
+        let mut w = parquet::Writer::new(f, parquet::USER_DAILY).unwrap();
+        w.row_group(
+            n,
+            &[
+                parquet::ColData { values: &uid, defs: None },
+                parquet::ColData { values: as_bytes(&day), defs: None },
+                parquet::ColData { values: as_bytes(&ones), defs: None },
+                parquet::ColData { values: as_bytes(&ones), defs: None },
+                parquet::ColData { values: as_bytes(&rev), defs: None },
+                parquet::ColData { values: &[], defs: Some(&defs) },
+            ],
+        )
+        .unwrap();
+        w.finish().unwrap();
+    }
     sys::exit_now(0);
 }
 
