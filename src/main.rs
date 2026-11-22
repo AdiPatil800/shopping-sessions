@@ -1899,7 +1899,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
     // S: as shipped; N: no request for the lines of dead copies; R: N plus reading blocks ahead; Q: shipped plus reading ahead
-    let runs: [(&str, usize, u32, u32); 9] = [("Sa", small, 0, 0), ("Na", small, 0, 0), ("Ra", small, 0, 0), ("Qa", small, 0, 0), ("Sb", small, 0, 0), ("Nb", small, 0, 0), ("Rb", small, 0, 0), ("Qb", small, 0, 0), ("Sa3", small, 0, 0)];
+    // S: as shipped; T: 32 KB sub-chunks; U: 64 KB
+    let runs: [(&str, usize, u32, u32); 7] = [("Sa", small, 0, 0), ("Ta", small, 0, 0), ("Ua", small, 0, 0), ("Sb", small, 0, 0), ("Tb", small, 0, 0), ("Ub", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1916,7 +1917,14 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
-        KILL_PF.store(!(label.starts_with('N') || label.starts_with('R')), Relaxed);
+        unsafe {
+            match label.as_bytes()[0] {
+                b'T' => std::env::set_var("SUB", "32768"),
+                b'U' => std::env::set_var("SUB", "65536"),
+                _ => std::env::remove_var("SUB"),
+            }
+        }
+        KILL_PF.store(false, Relaxed);
         buf::READ_AHEAD.store(label.starts_with('R') || label.starts_with('Q'), Relaxed);
         let t = Instant::now();
         let marks: std::sync::Mutex<([(u16, f64); 16], usize)> = std::sync::Mutex::new(([(0, 0.0); 16], 0));
@@ -1967,17 +1975,14 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         make_chunks(&tiled[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch_ck);
         // the share of the arenas each thread fills, with room to spare
         let share = ((ev_bytes / 85 * 32 + ck_bytes / 60 * 24) * small / nthreads) * 3 / 2 + (32 << 20);
-        // (name, next-line request distance or 0, scatter lookahead, table request while decoding)
-        let vars: [(&str, usize, usize, bool); 6] = [("no", 0, PF, true), ("a64", 64, PF, true), ("a128", 128, PF, true), ("a64n", 64, 9999, true), ("a64d", 64, PF, false), ("a192", 192, PF, true)];
+        // sub-chunk sizes
+        let vars: [(&str, usize); 6] = [("s16", 16 << 10), ("s32", 32 << 10), ("s64", 64 << 10), ("s128", 128 << 10), ("s8", 8 << 10), ("s256", 256 << 10)];
         for round in 0..2 {
-            for (name, ahead, pf, decpf) in vars {
-                buf::AHEAD.store(ahead > 0, Relaxed);
-                buf::AHEAD_BYTES.store(ahead.max(64), Relaxed);
-                DEC_PF.store(decpf, Relaxed);
+            for (name, sub) in vars {
                 let mut best = f64::MAX;
                 for _ in 0..2 {
                     let t = Instant::now();
-                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { pf, ..base });
+                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { sub, ..base });
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
                     for p in parsed.iter_mut() {
                         p.arena.free();
