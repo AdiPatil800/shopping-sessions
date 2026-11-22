@@ -941,6 +941,9 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
             }
             e.ts = rel as u32;
             e.uk = id_key(p1, l1);
+            // ask for the person-table line now: the scatter that follows this
+            // sub-chunk then finds it in the cache instead of waiting in line
+            ctx.person.prefetch(e.uk);
             e.uloc = locator(p1.offset(adj), l1);
             e.valid = 1;
         }
@@ -958,7 +961,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
     let (do_look, do_er, do_sr) = (matches!(m, 0 | 4 | 7), matches!(m, 0 | 5 | 7), matches!(m, 0 | 6));
     let mut sink = 0u64;
     for (i, e) in lr.iter().enumerate() {
-        if do_look {
+        if do_look && pp.pf < 4096 {
             if let Some(x) = lr.get(i + pp.pf) {
                 ctx.person.prefetch(x.uk);
             }
@@ -1003,15 +1006,19 @@ fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
             return;
         }
         let Some(camp) = ctx.lk.camp.get(id_key(p2, l2)) else { return };
-        lc.push(LC { uk: id_key(p1, l1), ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
+        let uk = id_key(p1, l1);
+        ctx.person.prefetch(uk);
+        lc.push(LC { uk, ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
     });
 }
 
 #[inline(always)]
 fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena, pp: &PP) {
     for (i, c) in lc.iter().enumerate() {
-        if let Some(x) = lc.get(i + pp.pf) {
-            ctx.person.prefetch(x.uk);
+        if pp.pf < 4096 {
+            if let Some(x) = lc.get(i + pp.pf) {
+                ctx.person.prefetch(x.uk);
+            }
         }
         let person = ctx.person.person(c.uk);
         cs.push(top_bits(person, pp.pbits), CR { person, ck: c.ck, ts: c.ts, camp: c.camp }, arena);
