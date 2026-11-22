@@ -256,6 +256,64 @@ pub unsafe fn parse_ts_fast(p: *const u8, len: usize) -> Option<i64> {
     parse_ts(p, len)
 }
 
+/// Remembers the day (in seconds) of the date prefixes seen, by day of month.
+#[derive(Clone, Copy)]
+pub struct DateCache {
+    e: [(u64, u16, i64); 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        DateCache { e: [(0, 0, 0); 64] }
+    }
+}
+
+/// `dt19` with the date looked up in `c`: a hit only needs the time of day.
+#[inline(always)]
+pub unsafe fn dt19_cached(p: *const u8, c: &mut DateCache) -> Option<i64> {
+    let a = (p as *const u64).read_unaligned();
+    let dd = (p.add(8) as *const u16).read_unaligned();
+    let idx = (((dd & 3) << 4) | ((dd >> 8) & 15)) as usize;
+    let ent = *c.e.get_unchecked(idx);
+    if ent.0 == a && ent.1 == dd {
+        let w = (p.add(11) as *const u64).read_unaligned(); // HH:MM:SS
+        let ok = (w & 0x0000_FF00_00FF_0000) == ((b':' as u64) << 40 | (b':' as u64) << 16) && digit_bad(w, 0x8080_0080_8000_8080) == 0 && *p.add(10) == b'T';
+        if ok {
+            let t = w & 0x0F0F_000F_0F00_0F0F;
+            let v = t.wrapping_mul(10).wrapping_add(t >> 8);
+            let (hh, mm, ss) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+            if hh > 23 || mm > 59 || ss > 59 {
+                return None;
+            }
+            return Some(ent.2 + hh * 3600 + mm * 60 + ss);
+        }
+        return dt19(p);
+    }
+    let r = dt19(p)?;
+    *c.e.get_unchecked_mut(idx) = (a, dd, r - r.rem_euclid(86_400));
+    Some(r)
+}
+
+/// `parse_ts_fast` with a date cache.
+#[inline(always)]
+pub unsafe fn parse_ts_cached(p: *const u8, len: usize, c: &mut DateCache) -> Option<i64> {
+    if len == 20 {
+        if *p.add(19) == b'Z' {
+            return dt19_cached(p, c).map(|s| s * 1000);
+        }
+        return parse_ts(p, len);
+    }
+    if len >= 1 && len <= 16 {
+        return digits16(p.add(len), len);
+    }
+    if len == 25 {
+        if let Some(shift) = f2_shift(p) {
+            return dt19_cached(p, c).map(|s| (s + shift) * 1000);
+        }
+    }
+    parse_ts(p, len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +337,7 @@ mod tests {
         };
         let alphabet = b"0123456789-:TZtz+. \x00\xff\xd9";
         let mut n = 0;
+        let mut cache = DateCache::new();
         for i in 0..3_000_000u64 {
             let mut s: Vec<u8>;
             match i % 4 {
@@ -287,7 +346,7 @@ mod tests {
                     let ms = (rnd() % 8_000_000_000_000) as i64 - 1_000_000_000_000;
                     let days = ms.div_euclid(86_400_000);
                     let _ = days;
-                    let y = 1900 + rnd() % 260;
+                    let y = if rnd() % 2 == 0 { 2027 + rnd() % 2 } else { 1900 + rnd() % 260 };
                     s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, rnd() % 14, rnd() % 33, rnd() % 26, rnd() % 62, rnd() % 62).into_bytes();
                     if rnd() % 3 == 0 {
                         let k = (rnd() % s.len() as u64) as usize;
@@ -315,6 +374,11 @@ mod tests {
             let a = parse_ts_slice(&s);
             let b = fast(&s);
             assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&s));
+            let mut buf = b"xxxxxxxxxxxxxxxx".to_vec();
+            buf.extend_from_slice(&s);
+            buf.extend_from_slice(b",yyyyyyyyyyyyyyyyyyyyyyyy");
+            let c = unsafe { parse_ts_cached(buf.as_ptr().add(16), s.len(), &mut cache) };
+            assert_eq!(a, c, "cached {:?}", String::from_utf8_lossy(&s));
             n += a.is_some() as u64;
         }
         assert!(n > 100_000, "{n}");

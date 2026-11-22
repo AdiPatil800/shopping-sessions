@@ -148,10 +148,10 @@ fn key_at(buf: &[u8], s: usize, e: usize) -> u64 {
 
 /// A timestamp field `b[s..e]` to milliseconds.
 #[inline(always)]
-fn ts_at(b: &[u8], s: usize, e: usize) -> Option<i64> {
+fn ts_at(b: &[u8], s: usize, e: usize, dc: &mut ts::DateCache) -> Option<i64> {
     let len = e - s;
-    if e >= 16 && len <= 25 {
-        unsafe { ts::parse_ts_fast(b.as_ptr().add(s), len) }
+    if e >= 16 && len <= 25 && s + 25 <= b.len() {
+        unsafe { ts::parse_ts_cached(b.as_ptr().add(s), len, dc) }
     } else {
         ts::parse_ts_slice(&b[s..e])
     }
@@ -574,6 +574,27 @@ fn main() {
         Parsed { es, ss, cs, arena }
     });
     log(&t0, "parsed");
+    // Unmap the inputs now, in parallel: at exit this would be done by one thread.
+    if std::env::var("KEEP_MAPS").is_err() {
+        const STEP: usize = 16 << 20;
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        for m in &maps {
+            let len = (m.len + 4095) & !4095;
+            let mut o = 0;
+            while o < len {
+                let n = STEP.min(len - o);
+                jobs.push((m.ptr as usize + o, n));
+                o += n;
+            }
+        }
+        let next = AtomicUsize::new(0);
+        run_threads(nthreads, |_| loop {
+            let k = next.fetch_add(1, Relaxed);
+            let Some(&(p, n)) = jobs.get(k) else { break };
+            sys::unmap(p as *const u8, n);
+        });
+        log(&t0, "inputs unmapped");
+    }
 
     // --- dedup: kill every copy but the earliest-ingested one
     let next = AtomicUsize::new(0);
@@ -613,6 +634,7 @@ fn main() {
 #[inline(always)]
 fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, lr: &mut Vec<LR>) {
     let mut f = [(0usize, 0usize); 7];
+    let mut dc = ts::DateCache::new();
     scan::scan_lines(b, start, end, |ls, le, commas, nc, qc| {
         if nc != 6 || !scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
             return;
@@ -622,7 +644,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, lr: &mut Vec<LR>)
             return;
         }
         let ek = key_at(b, s0, e0);
-        let ingest_ms = ts_at(b, f[3].0, f[3].1);
+        let ingest_ms = ts_at(b, f[3].0, f[3].1, &mut dc);
         let ingest = match ingest_ms {
             Some(ms) => (ms.div_euclid(1000) - ctx.base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             None => u32::MAX,
@@ -632,7 +654,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, lr: &mut Vec<LR>)
             if f[1].0 == f[1].1 || f[5].0 == f[5].1 {
                 break 'v;
             }
-            let Some(t) = ts_at(b, f[2].0, f[2].1) else { break 'v };
+            let Some(t) = ts_at(b, f[2].0, f[2].1, &mut dc) else { break 'v };
             let rel = t - ctx.base;
             if rel < ctx.ws_rel as i64 || rel >= ctx.we_rel as i64 {
                 break 'v;
@@ -683,6 +705,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
 #[inline(always)]
 fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, lc: &mut Vec<LC>) {
     let mut f = [(0usize, 0usize); 4];
+    let mut dc = ts::DateCache::new();
     scan::scan_lines(b, start, end, |ls, le, commas, nc, qc| {
         if nc != 3 || !scan::fields::<4>(b, ls, le, commas, qc, &mut f) {
             return;
@@ -690,7 +713,7 @@ fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, lc: &mut Vec<LC>)
         if f[0].0 == f[0].1 || f[1].0 == f[1].1 || f[2].0 == f[2].1 {
             return;
         }
-        let Some(t) = ts_at(b, f[3].0, f[3].1) else { return };
+        let Some(t) = ts_at(b, f[3].0, f[3].1, &mut dc) else { return };
         let rel = t - ctx.base;
         if rel < 0 || rel >= ctx.we_rel as i64 {
             return;
@@ -1356,6 +1379,7 @@ fn bench(ctx: &Ctx, maps: &[sys::Mapped], chunks: &[Chunk], nthreads: usize) {
             let mut acc = 0u64;
             let mut lr: Vec<LR> = Vec::with_capacity(1 << 15);
             let mut f = [(0usize, 0usize); 7];
+            let mut dc = ts::DateCache::new();
             loop {
                 let k = next.fetch_add(1, Relaxed);
                 let Some(c) = chunks.get(k) else { break };
@@ -1384,13 +1408,13 @@ fn bench(ctx: &Ctx, maps: &[sys::Mapped], chunks: &[Chunk], nthreads: usize) {
                     }),
                     4 => scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
                         if nc == 6 && scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-                            acc += ts_at(b, f[2].0, f[2].1).unwrap_or(0) as u64;
-                            acc += ts_at(b, f[3].0, f[3].1).unwrap_or(0) as u64;
+                            acc += ts_at(b, f[2].0, f[2].1, &mut dc).unwrap_or(0) as u64;
+                            acc += ts_at(b, f[3].0, f[3].1, &mut dc).unwrap_or(0) as u64;
                         }
                     }),
                     5 => scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
                         if nc == 6 && scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-                            acc += ts_at(b, f[3].0, f[3].1).unwrap_or(0) as u64;
+                            acc += ts_at(b, f[3].0, f[3].1, &mut dc).unwrap_or(0) as u64;
                         }
                     }),
                     _ => {
