@@ -38,6 +38,10 @@ impl Arena {
         self.used += bytes;
         p as *mut u8
     }
+    /// Bytes handed out so far.
+    pub fn used(&self) -> usize {
+        self.used
+    }
     #[inline(always)]
     pub fn base(&self) -> *mut u8 {
         self.base as *mut u8

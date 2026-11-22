@@ -33,6 +33,14 @@ pub const MADV_WILLNEED: i32 = 3;
 pub const MADV_HUGEPAGE: i32 = 14;
 
 pub fn exit_now(code: i32) -> ! {
+    // an instrumented build writes its profile here: `_exit` skips the usual hook
+    #[cfg(feature = "profgen")]
+    unsafe {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        __llvm_profile_write_file();
+    }
     unsafe { _exit(code) }
 }
 

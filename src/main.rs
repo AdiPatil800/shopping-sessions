@@ -571,6 +571,11 @@ fn main() {
         write_extra_rows(&out.join("user_daily"), ctx.day0, &rows);
     }
     let _ = &ctx;
+    if prof() {
+        let st = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let keep: Vec<&str> = st.lines().filter(|l| ["Rss:", "Anonymous:", "AnonHugePages:", "Shared_Clean:", "Private_Clean:", "Private_Dirty:"].iter().any(|k| l.starts_with(k))).collect();
+        eprintln!("at exit: {}", keep.join(" | "));
+    }
     sys::exit_now(0);
 }
 
@@ -660,28 +665,6 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     };
     let parsed: Vec<Parsed> = parse_phase(&ctx, maps, files, &chunks, &pp);
     log("parsed");
-    // Unmap the inputs now, in parallel: at exit this would be done by one thread.
-    if unmap && !pp.pread {
-        const STEP: usize = 16 << 20;
-        let mut jobs: Vec<(usize, usize)> = Vec::new();
-        for m in maps {
-            let len = (m.len + 4095) & !4095;
-            let mut o = 0;
-            while o < len {
-                let n = STEP.min(len - o);
-                jobs.push((m.ptr as usize + o, n));
-                o += n;
-            }
-        }
-        let next = AtomicUsize::new(0);
-        run_threads(nthreads, |_| loop {
-            let k = next.fetch_add(1, Relaxed);
-            let Some(&(p, n)) = jobs.get(k) else { break };
-            sys::drop_pages(p as *const u8, n);
-        });
-        log("inputs unmapped");
-    }
-
     // --- dedup: kill every copy but the earliest-ingested one
     let next = AtomicUsize::new(0);
     let killed: Vec<usize> = run_threads(nthreads, |_| dedup_worker(&parsed, nb, &next));
@@ -717,6 +700,29 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     }
     write_campaign_daily(&out.join("campaign_daily").join("part-000.parquet"), &ctx.lk.camp_ids, &ctx.lk.camp_channels, &camp_tot, day0, nd);
     log(&format!("wrote {total_ud} user_daily rows"));
+    // Give the inputs and the record arenas back here, on every core, rather
+    // than leaving them to the single-threaded teardown at exit. (The inputs
+    // stay mapped until now: the names of long IDs are read from them.)
+    if unmap && !pp.pread {
+        const STEP: usize = 16 << 20;
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        for (ptr, len) in maps.iter().map(|m| (m.ptr as usize, m.len)).chain(parsed.iter().map(|p| (p.arena.base() as usize, p.arena.used()))) {
+            let len = (len + 4095) & !4095;
+            let mut o = 0;
+            while o < len {
+                let n = STEP.min(len - o);
+                jobs.push((ptr + o, n));
+                o += n;
+            }
+        }
+        let next = AtomicUsize::new(0);
+        run_threads(nthreads, |_| loop {
+            let k = next.fetch_add(1, Relaxed);
+            let Some(&(p, n)) = jobs.get(k) else { break };
+            sys::drop_pages(p as *const u8, n);
+        });
+        log("released");
+    }
     #[cfg(feature = "selfbench")]
     {
         let mut parsed = parsed;
