@@ -298,38 +298,73 @@ pub unsafe fn parse_ts_fast(p: *const u8, len: usize) -> Option<i64> {
 /// Remembers the day (in seconds) of the date prefixes seen, by day of month.
 #[derive(Clone, Copy)]
 pub struct DateCache {
-    e: [(u64, u16, i64); 64],
+    e: [[u64; 4]; 64], // first 8 bytes, day-of-month bytes, day in seconds, unused
 }
 
 impl DateCache {
     pub fn new() -> Self {
-        DateCache { e: [(0, 0, 0); 64] }
+        DateCache { e: [[0; 4]; 64] }
     }
+}
+
+/// Seconds into the day of `THH:MM:SS` at bytes 10..19 of the timestamp at `p`
+/// (bytes 3..19 are read), or None unless that is exactly a valid time.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn tod_secs(p: *const u8) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p.add(3) as *const __m128i);
+    let tmpl = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0);
+    const FIXED: i32 = (1 << 7) | (1 << 10) | (1 << 13);
+    let fixed = _mm_movemask_epi8(_mm_cmpeq_epi8(v, tmpl)) & FIXED;
+    let dig = _mm_shuffle_epi8(v, _mm_setr_epi8(8, 9, 11, 12, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    let z = b'0' as i8;
+    let d = _mm_sub_epi8(dig, _mm_setr_epi8(z, z, z, z, z, z, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    let over = _mm_subs_epu8(d, _mm_setr_epi8(2, 9, 5, 9, 5, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    if fixed != FIXED || _mm_testz_si128(over, over) == 0 {
+        return None;
+    }
+    let pair = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    let s2 = _mm_madd_epi16(pair, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+    let hm = _mm_cvtsi128_si32(s2);
+    if hm >= 86_400 {
+        return None;
+    }
+    Some((hm + _mm_extract_epi32(s2, 1)) as i64)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn tod_secs(p: *const u8) -> Option<i64> {
+    let w = (p.add(11) as *const u64).read_unaligned(); // HH:MM:SS
+    let ok = (w & 0x0000_FF00_00FF_0000) == ((b':' as u64) << 40 | (b':' as u64) << 16) && digit_bad(w, 0x8080_0080_8000_8080) == 0 && *p.add(10) == b'T';
+    if !ok {
+        return None;
+    }
+    let t = w & 0x0F0F_000F_0F00_0F0F;
+    let v = t.wrapping_mul(10).wrapping_add(t >> 8);
+    let (hh, mm, ss) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    Some(hh * 3600 + mm * 60 + ss)
 }
 
 /// `dt19` with the date looked up in `c`: a hit only needs the time of day.
 #[inline(always)]
 pub unsafe fn dt19_cached(p: *const u8, c: &mut DateCache) -> Option<i64> {
     let a = (p as *const u64).read_unaligned();
-    let dd = (p.add(8) as *const u16).read_unaligned();
+    let dd = (p.add(8) as *const u16).read_unaligned() as u64;
     let idx = (((dd & 3) << 4) | ((dd >> 8) & 15)) as usize;
-    let ent = *c.e.get_unchecked(idx);
-    if ent.0 == a && ent.1 == dd {
-        let w = (p.add(11) as *const u64).read_unaligned(); // HH:MM:SS
-        let ok = (w & 0x0000_FF00_00FF_0000) == ((b':' as u64) << 40 | (b':' as u64) << 16) && digit_bad(w, 0x8080_0080_8000_8080) == 0 && *p.add(10) == b'T';
-        if ok {
-            let t = w & 0x0F0F_000F_0F00_0F0F;
-            let v = t.wrapping_mul(10).wrapping_add(t >> 8);
-            let (hh, mm, ss) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
-            if hh > 23 || mm > 59 || ss > 59 {
-                return None;
-            }
-            return Some(ent.2 + hh * 3600 + mm * 60 + ss);
-        }
-        return dt19(p);
+    let ent = c.e.get_unchecked(idx);
+    if ent[0] == a && ent[1] == dd {
+        return match tod_secs(p) {
+            Some(t) => Some(ent[2] as i64 + t),
+            None => dt19(p),
+        };
     }
     let r = dt19(p)?;
-    *c.e.get_unchecked_mut(idx) = (a, dd, r - r.rem_euclid(86_400));
+    *c.e.get_unchecked_mut(idx) = [a, dd, (r - r.rem_euclid(86_400)) as u64, 0];
     Some(r)
 }
 

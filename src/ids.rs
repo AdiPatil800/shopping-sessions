@@ -49,21 +49,39 @@ fn compress7(mut x: u64) -> u64 {
     x
 }
 
-/// The key of a non-empty ID. Reads up to 9 bytes from `p` when `len <= 9`,
-/// and 8 bytes even when `len < 8`: the caller guarantees 8 readable bytes.
+/// A mask of the low `len` bytes of a u64 (all of them for `len >= 8`).
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn low_bytes(len: usize) -> u64 {
+    unsafe { std::arch::x86_64::_bzhi_u64(!0u64, (len as u32) * 8) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+#[inline(always)]
+fn low_bytes(len: usize) -> u64 {
+    if len >= 8 {
+        !0u64
+    } else {
+        (1u64 << (len * 8)) - 1
+    }
+}
+
+/// The key of a non-empty ID. Reads 9 bytes from `p` whatever `len` is: the
+/// caller guarantees they are readable.
 #[inline(always)]
 pub unsafe fn id_key(p: *const u8, len: usize) -> u64 {
     debug_assert!(len > 0);
     if len <= 9 {
         let raw = std::ptr::read_unaligned(p as *const u64);
-        let m = if len >= 8 { !0u64 } else { (1u64 << (len * 8)) - 1 };
+        let m = low_bytes(len);
         let lo = raw & m;
-        let ninth = if len == 9 { *p.add(8) as u64 } else { 0 };
-        let high = (lo & 0x8080_8080_8080_8080) | (ninth & 0x80);
+        let is9 = (len == 9) as u64;
+        let ninth = (*p.add(8) as u64) & 0u64.wrapping_sub(is9);
+        // every byte must be 0x01..=0x7F: no high bit, and no zero among the first `len`
         let x = lo | (!m & 0x0101_0101_0101_0101);
-        let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-        let ninth_zero = (len == 9) & (ninth == 0);
-        if (high | zero) == 0 && !ninth_zero {
+        let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x;
+        let ninth_bad = (ninth.wrapping_sub(is9) | ninth) & 0x80; // ninth == 0 when present, or >= 0x80
+        if ((lo | zero) & 0x8080_8080_8080_8080) | ninth_bad == 0 {
             return (compress7(lo.swap_bytes()) << 7) | ninth;
         }
     }

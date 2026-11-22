@@ -143,7 +143,7 @@ fn find_nl(b: &[u8], mut i: usize) -> usize {
 #[inline(always)]
 fn key_at(buf: &[u8], s: usize, e: usize) -> u64 {
     let len = e - s;
-    if len <= 9 && s + 8 <= buf.len() {
+    if len <= 9 && s + 9 <= buf.len() {
         unsafe { id_key(buf.as_ptr().add(s), len) }
     } else {
         id_key_slice(&buf[s..e])
@@ -386,6 +386,38 @@ macro_rules! last_field {
             (s, e)
         }
     }};
+}
+
+/// Field `i` of a row as (pointer, length), quotes stripped. Only for buffers
+/// with at least 64 readable bytes on both sides of the row.
+macro_rules! fld {
+    ($base:expr, $rs:expr, $q:expr, $i:expr) => {{
+        let s = if $i == 0 { $base.add($rs as usize) } else { $base.add($q[$i - 1] as usize + 1) };
+        let e = $base.add($q[$i] as usize);
+        let qf = (*s == b'"') as usize;
+        (s.add(qf), (e as usize - s as usize) - 2 * qf)
+    }};
+}
+
+/// `event_kind` without bounds checks (8 readable bytes at `p`).
+#[inline(always)]
+unsafe fn kind_p(p: *const u8, len: usize) -> u8 {
+    let w = (p as *const u64).read_unaligned();
+    let w4 = w as u32;
+    let k4 = (w4 == u32::from_le_bytes(*b"view")) as u8 + 2 * (w4 == u32::from_le_bytes(*b"cart")) as u8;
+    let k8 = 3 * (w == u64::from_le_bytes(*b"purchase")) as u8;
+    (k4 & 0u8.wrapping_sub((len == 4) as u8)) | (k8 & 0u8.wrapping_sub((len == 8) as u8))
+}
+
+/// A timestamp to milliseconds, without bounds checks (16 readable bytes
+/// before `p`, 25 from it).
+#[inline(always)]
+unsafe fn ts_p(p: *const u8, len: usize, dc: &mut ts::DateCache) -> Option<i64> {
+    if len <= 25 {
+        ts::parse_ts_cached(p, len, dc)
+    } else {
+        ts::parse_ts(p, len)
+    }
 }
 
 fn load_lookups(data: &Path) -> Lookups {
@@ -702,6 +734,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
         let mut ix = scan2::Index::new();
         let mut dc = ts::DateCache::new();
         let mut rbuf: Vec<u8> = Vec::new();
+        let mut pad: Vec<u8> = Vec::new();
         let timing = prof();
         let mut tm = [0f64; 4];
         let mut sink = 0u64;
@@ -731,6 +764,21 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
             let mut pos = cstart;
             while pos < cend {
                 let sub_end = sub_chunk(b, pos, cend, pp.sub);
+                let next_pos = sub_end;
+                {
+                // The decoders read a little outside each field: a piece too near
+                // either end of its buffer is parsed from a padded copy instead.
+                let (b, pos, sub_end): (&[u8], usize, usize) = if pos >= 64 && sub_end + 64 <= b.len() {
+                    (b, pos, sub_end)
+                } else {
+                    let n = sub_end - pos;
+                    pad.clear();
+                    pad.resize(64, b'\n');
+                    pad.extend_from_slice(&b[pos..sub_end]);
+                    pad.resize(64 + n + 64, 0);
+                    (&pad[..64 + n], 64, 64 + n)
+                };
+                let _ = sub_end;
                 let q0 = if timing { Some(Instant::now()) } else { None };
                 if pp.mode == 1 {
                     scan2::index(b, pos, sub_end, &mut ix);
@@ -762,7 +810,8 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                         tm[3] += q1.unwrap().elapsed().as_secs_f64();
                     }
                 }
-                pos = sub_end;
+                }
+                pos = next_pos;
             }
         }
         std::hint::black_box(sink);
@@ -789,37 +838,40 @@ fn sub_chunk(b: &[u8], start: usize, end: usize, w: usize) -> usize {
     e
 }
 
+/// Parses the event rows of `b[start..end]`. The caller guarantees 64 readable
+/// bytes before `start` and after `end`.
 #[inline(always)]
 fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lr: &mut Vec<LR>) {
-    let p = b.as_ptr();
     scan2::index(b, start, end, ix);
-    scan2::rows::<7>(ix, |rs, q| {
-        let (s0, e0) = field!(p, start, rs, q, 0);
-        if s0 == e0 {
+    let base = unsafe { b.as_ptr().add(start) };
+    let (ws_rel, we_rel, cbase, base_s) = (ctx.ws_rel as i64, ctx.we_rel as i64, ctx.base, ctx.base_s);
+    scan2::rows::<7>(ix, |rs, q| unsafe {
+        let (p0, l0) = fld!(base, rs, q, 0);
+        if l0 == 0 {
             return;
         }
-        let ek = key_at(b, s0, e0);
-        let (s3, e3) = field!(p, start, rs, q, 3);
-        let ingest_ms = ts_at(b, s3, e3, dc);
+        let ek = id_key(p0, l0);
+        let (p3, l3) = fld!(base, rs, q, 3);
+        let ingest_ms = ts_p(p3, l3, dc);
         let ingest = match ingest_ms {
-            Some(ms) => (ms.div_euclid(1000) - ctx.base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
+            Some(ms) => (ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             None => u32::MAX,
         };
         let mut e = LR { ek, uk: 0, ingest, ts: 0, pay: 0, valid: 0 };
         'v: {
-            let (s1, e1) = field!(p, start, rs, q, 1);
-            let (s5, e5) = field!(p, start, rs, q, 5);
-            if s1 == e1 || s5 == e5 {
+            let (p1, l1) = fld!(base, rs, q, 1);
+            let (p5, l5) = fld!(base, rs, q, 5);
+            if l1 == 0 || l5 == 0 {
                 break 'v;
             }
-            let (s2, e2) = field!(p, start, rs, q, 2);
-            let Some(t) = ts_at(b, s2, e2, dc) else { break 'v };
-            let rel = t - ctx.base;
-            if rel < ctx.ws_rel as i64 || rel >= ctx.we_rel as i64 {
+            let (p2, l2) = fld!(base, rs, q, 2);
+            let Some(t) = ts_p(p2, l2, dc) else { break 'v };
+            let rel = t - cbase;
+            if rel < ws_rel || rel >= we_rel {
                 break 'v;
             }
-            let (s4, e4) = field!(p, start, rs, q, 4);
-            let kind = event_kind(b, s4, e4);
+            let (p4, l4) = fld!(base, rs, q, 4);
+            let kind = kind_p(p4, l4);
             if kind == 0 {
                 break 'v;
             }
@@ -828,14 +880,13 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
                 _ => break 'v,
             }
             if kind == 3 {
-                let (s6, e6) = last_field!(b, start, q, 6);
-                let Some(pr) = parse_price(&b[s6..e6]) else { break 'v };
-                let pk = key_at(b, s5, e5);
-                let cat = ctx.lk.prod.get(pk).map(|c| c as u32).unwrap_or(ctx.lk.unknown_cat);
+                let (p6, l6) = fld!(base, rs, q, 6);
+                let Some(pr) = parse_price(std::slice::from_raw_parts(p6, l6)) else { break 'v };
+                let cat = ctx.lk.prod.get(id_key(p5, l5)).map(|c| c as u32).unwrap_or(ctx.lk.unknown_cat);
                 e.pay = pr | (cat << 24);
             }
             e.ts = rel as u32;
-            e.uk = key_at(b, s1, e1);
+            e.uk = id_key(p1, l1);
             e.valid = 1;
         }
         lr.push(e);
@@ -861,25 +912,26 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
     }
 }
 
+/// Parses the click rows of `b[start..end]`; same padding guarantee as `parse_events`.
 #[inline(always)]
 fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lc: &mut Vec<LC>) {
-    let p = b.as_ptr();
     scan2::index(b, start, end, ix);
-    scan2::rows::<4>(ix, |rs, q| {
-        let (s0, e0) = field!(p, start, rs, q, 0);
-        let (s1, e1) = field!(p, start, rs, q, 1);
-        let (s2, e2) = field!(p, start, rs, q, 2);
-        if s0 == e0 || s1 == e1 || s2 == e2 {
+    let base = unsafe { b.as_ptr().add(start) };
+    scan2::rows::<4>(ix, |rs, q| unsafe {
+        let (p0, l0) = fld!(base, rs, q, 0);
+        let (p1, l1) = fld!(base, rs, q, 1);
+        let (p2, l2) = fld!(base, rs, q, 2);
+        if l0 == 0 || l1 == 0 || l2 == 0 {
             return;
         }
-        let (s3, e3) = last_field!(b, start, q, 3);
-        let Some(t) = ts_at(b, s3, e3, dc) else { return };
+        let (p3, l3) = fld!(base, rs, q, 3);
+        let Some(t) = ts_p(p3, l3, dc) else { return };
         let rel = t - ctx.base;
         if rel < 0 || rel >= ctx.we_rel as i64 {
             return;
         }
-        let Some(camp) = ctx.lk.camp.get(key_at(b, s2, e2)) else { return };
-        lc.push(LC { uk: key_at(b, s1, e1), ck: key_at(b, s0, e0), ts: rel as u32, camp: camp as u32 });
+        let Some(camp) = ctx.lk.camp.get(id_key(p2, l2)) else { return };
+        lc.push(LC { uk: id_key(p1, l1), ck: id_key(p0, l0), ts: rel as u32, camp: camp as u32 });
     });
 }
 

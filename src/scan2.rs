@@ -83,7 +83,7 @@ pub fn index(buf: &[u8], start: usize, end: usize, ix: &mut Index) {
         let next = load(p + 64);
         let (nl, cm, q) = cur;
         let s = nl | cm;
-        if q != 0 || cin || close_carry != 0 {
+        {
             let starts = (s << 1) | prev_s63;
             let ends = (s >> 1) | ((next.0 | next.1) << 63);
             let open = q & starts;
