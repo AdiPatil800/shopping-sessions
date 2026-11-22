@@ -1645,11 +1645,11 @@ fn tile_ids(buf: &mut [u8], k: u8) {
     }
 }
 
-/// Times variants of the parse phase on this machine, and the whole pipeline on
-/// the inputs tiled several times with distinct IDs. Returns text rows.
+/// Times the whole pipeline, and variants of the parse phase, on the inputs
+/// tiled several times with distinct IDs. Returns text rows.
 #[cfg(feature = "selfbench")]
 #[allow(clippy::too_many_arguments)]
-fn self_bench(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usize, nthreads: usize, ws: i64, we: i64, data: &Path, out_dir: &Path) -> Vec<String> {
+fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usize, nthreads: usize, ws: i64, we: i64, data: &Path, out_dir: &Path) -> Vec<String> {
     let ev_bytes: usize = maps[..nev].iter().map(|m| m.len).sum();
     let ck_bytes: usize = maps[nev..nev + nck].iter().map(|m| m.len).sum();
     let reps = ((1usize << 30) / ev_bytes.max(1)).clamp(1, 64);
@@ -1657,7 +1657,6 @@ fn self_bench(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: usi
 
     // 1. the whole pipeline on a tiled copy held in anonymous memory
     let mut tiled: Vec<sys::Mapped> = Vec::new();
-    let t = Instant::now();
     for (lo, hi) in [(0, nev), (nev, nev + nck), (nev + nck, maps.len())] {
         for k in 0..reps {
             for m in &maps[lo..hi] {
@@ -1669,72 +1668,44 @@ fn self_bench(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: usi
             }
         }
     }
-    out.push(("mk".into(), t.elapsed().as_secs_f64() * 1e3));
+    let (tnev, tnck) = (nev * reps, nck * reps);
     let bdir = out_dir.join("_bench");
-    for round in 0..2 {
+    let mut tctx: Option<Ctx> = None;
+    for (round, threads) in [(0usize, nthreads), (1, nthreads), (2, (nthreads / 2).max(1))] {
         let _ = std::fs::remove_dir_all(&bdir);
         std::fs::create_dir_all(bdir.join("user_daily")).unwrap();
         std::fs::create_dir_all(bdir.join("campaign_daily")).unwrap();
         let t = Instant::now();
         let marks: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
         let d2 = data.to_path_buf();
-        pipeline(&tiled, &[], nev * reps, nck * reps, ws, we, move || load_lookups(&d2), &bdir, nthreads, false, &|w: &str| {
+        let c = pipeline(&tiled, &[], tnev, tnck, ws, we, move || load_lookups(&d2), &bdir, threads, false, &|w: &str| {
             let name: String = w.chars().take_while(|c| c.is_ascii_alphabetic() || *c == ' ').take(7).collect::<String>().replace(' ', "");
             marks.lock().unwrap().push((name, t.elapsed().as_secs_f64() * 1e3));
         });
+        tctx = Some(c);
+        let mut prev = 0.0;
         for (n, v) in marks.into_inner().unwrap() {
-            out.push((format!("T{round}{n}"), v));
+            out.push((format!("{}{}", ["A", "B", "H"][round], &n[..n.len().min(5)]), v - prev));
+            prev = v;
         }
     }
     let t = Instant::now();
     let _ = std::fs::remove_dir_all(&bdir);
     out.push(("rmout".into(), t.elapsed().as_secs_f64() * 1e3));
-    for m in &tiled {
-        sys::unmap(m.ptr, (m.len + 4096 + 4095) & !4095);
-    }
+    let tctx = tctx.unwrap();
 
-    // 2. fresh mappings of the real inputs: first-touch and unmap cost
-    {
-        let ev_files = csv_files(&data.join("events"));
-        let fresh: Vec<sys::Mapped> = ev_files.iter().map(|p| sys::Mapped::open(p, false).unwrap().0).collect();
-        let mut ch = Vec::new();
-        make_chunks(&fresh, 0, 0, 1 << 20, &mut ch);
-        let pp = PP { sub: 16 << 10, pbits: 10, bbits: 10, mode: 3, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap: 4096 };
-        let t = Instant::now();
-        parse_phase(ctx, &fresh, files, &ch, &pp);
-        out.push(("ftouch".into(), t.elapsed().as_secs_f64() * 1e3));
-        let t = Instant::now();
-        let next = AtomicUsize::new(0);
-        run_threads(nthreads, |_| loop {
-            let k = next.fetch_add(1, Relaxed);
-            let Some(m) = fresh.get(k) else { break };
-            if m.len > 0 {
-                sys::unmap(m.ptr, (m.len + 4095) & !4095);
-            }
-        });
-        out.push(("funmap".into(), t.elapsed().as_secs_f64() * 1e3));
-    }
-
-    // 3. parse-phase variants on the real inputs replayed `reps` times
-    let chunks_of = |size: usize| -> Vec<Chunk> {
-        let mut one = Vec::new();
-        make_chunks(&maps[..nev], 0, 0, size, &mut one);
-        make_chunks(&maps[nev..nev + nck], nev, 1, size, &mut one);
-        let mut all = Vec::with_capacity(one.len() * reps);
-        for _ in 0..reps {
-            all.extend_from_slice(&one);
-        }
-        all
-    };
+    // 2. parse-phase variants on the tiled inputs
+    let mut c1m = Vec::new();
+    make_chunks(&tiled[..tnev], 0, 0, 1 << 20, &mut c1m);
+    make_chunks(&tiled[tnev..tnev + tnck], tnev, 1, 1 << 20, &mut c1m);
     let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
-    let base = PP { sub: 16 << 10, pbits: 10, bbits: 10, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap };
-    let c1m = chunks_of(1 << 20);
-    let c256 = chunks_of(256 << 10);
-    let mut run = |name: &str, chunks: &[Chunk], pp: PP| {
+    let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap };
+    let half = (nthreads / 2).max(1);
+    let mut run = |name: &str, pp: PP| {
         let mut best = f64::MAX;
         for _ in 0..2 {
             let t = Instant::now();
-            let mut parsed = parse_phase(ctx, maps, files, chunks, &pp);
+            let mut parsed = parse_phase(&tctx, &tiled, files, &c1m, &pp);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
             for p in parsed.iter_mut() {
                 p.arena.free();
@@ -1742,44 +1713,52 @@ fn self_bench(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: usi
         }
         out.push((name.to_string(), best));
     };
-    run("base", &c1m, base);
-    run("touch", &c1m, PP { mode: 3, ..base });
-    run("idx", &c1m, PP { mode: 1, ..base });
-    run("prs", &c1m, PP { mode: 2, ..base });
-    run("s4k", &c1m, PP { sub: 4 << 10, ..base });
-    run("s64k", &c1m, PP { sub: 64 << 10, ..base });
-    run("s1m", &c1m, PP { sub: 1 << 20, ..base });
-    run("b8", &c1m, PP { pbits: 8, bbits: 8, ..base });
-    run("b9", &c1m, PP { pbits: 9, bbits: 9, ..base });
-    run("b11", &c1m, PP { pbits: 11, bbits: 11, ..base });
-    run("b12", &c1m, PP { pbits: 12, bbits: 12, ..base });
-    run("pr1m", &c1m, PP { pread: true, ..base });
-    run("pr256", &c256, PP { pread: true, ..base });
-    run("c256", &c256, base);
-    run("nohuge", &c1m, PP { huge: false, ..base });
-    run("t4", &c1m, PP { threads: (nthreads / 2).max(1), ..base });
-    run("blk64", &c1m, PP { block: 64, ..base });
-    run("blk1k", &c1m, PP { block: 1024, ..base });
-    run("pf0", &c1m, PP { pf: usize::MAX / 2, ..base });
-    run("pf32", &c1m, PP { pf: 32, ..base });
-    run("base2", &c1m, base);
+    run("tch", PP { mode: 3, ..base });
+    run("idx", PP { mode: 1, ..base });
+    run("dec", PP { mode: 2, ..base });
+    run("full", base);
+    run("tch4", PP { mode: 3, threads: half, ..base });
+    run("idx4", PP { mode: 1, threads: half, ..base });
+    run("dec4", PP { mode: 2, threads: half, ..base });
+    run("full4", PP { threads: half, ..base });
+    run("b8", PP { pbits: 8, bbits: 8, ..base });
+    run("b12", PP { pbits: 12, bbits: 12, ..base });
+    run("nohuge", PP { huge: false, ..base });
+    run("s4k", PP { sub: 4 << 10, ..base });
+    run("s64k", PP { sub: 64 << 10, ..base });
+    run("pf0", PP { pf: usize::MAX / 2, ..base });
+    run("blk1k", PP { block: 1024, ..base });
+
+    // 3. fresh mappings of the real inputs: first-touch and page-drop cost
+    {
+        let ev_files = csv_files(&data.join("events"));
+        let fresh: Vec<sys::Mapped> = ev_files.iter().map(|p| sys::Mapped::open(p, false).unwrap().0).collect();
+        let mut ch = Vec::new();
+        make_chunks(&fresh, 0, 0, 1 << 20, &mut ch);
+        let pp = PP { mode: 3, ..base };
+        let t = Instant::now();
+        parse_phase(&tctx, &fresh, files, &ch, &pp);
+        out.push(("ftouch".into(), t.elapsed().as_secs_f64() * 1e3));
+        let t = Instant::now();
+        let next = AtomicUsize::new(0);
+        run_threads(nthreads, |_| loop {
+            let k = next.fetch_add(1, Relaxed);
+            let Some(m) = fresh.get(k) else { break };
+            if m.len > 0 {
+                sys::drop_pages(m.ptr, (m.len + 4095) & !4095);
+            }
+        });
+        out.push(("fdrop".into(), t.elapsed().as_secs_f64() * 1e3));
+    }
+    let _ = maps;
     // fixed costs
     let t = Instant::now();
     for _ in 0..20 {
         run_threads(nthreads, |_| 0u8);
     }
     let spawn = t.elapsed().as_secs_f64() * 1e3 / 20.0;
-    let t = Instant::now();
-    let blob = vec![1u8; 1 << 20];
-    for i in 0..8 {
-        let _ = std::fs::write(out_dir.join(format!("_b{i}.bin")), &blob);
-    }
-    let create = t.elapsed().as_secs_f64() * 1e3 / 8.0;
-    for i in 0..8 {
-        let _ = std::fs::remove_file(out_dir.join(format!("_b{i}.bin")));
-    }
     let mut rows = Vec::new();
-    let mut cur = format!("!F reps{reps} spawn8={spawn:.2} create1M={create:.2} |");
+    let mut cur = format!("!F reps{reps} spawn8={spawn:.2} |");
     for (n, v) in &out {
         let item = format!(" {n}={v:.0}");
         if cur.len() + item.len() > 215 {
