@@ -1673,6 +1673,22 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         }
     }
     let (tnev, tnck) = (nev * reps, nck * reps);
+    // the parse phase alone, before anything else has run on this data
+    {
+        let mut c1m = Vec::new();
+        make_chunks(&tiled[..tnev], 0, 0, 1 << 20, &mut c1m);
+        make_chunks(&tiled[tnev..tnev + tnck], tnev, 1, 1 << 20, &mut c1m);
+        let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
+        let pp = PP { sub: 16 << 10, pbits: _ctx.pbits.max(9), bbits: _ctx.bbits.max(9), mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
+        for name in ["first", "second"] {
+            let t = Instant::now();
+            let mut parsed = parse_phase(_ctx, &tiled, files, &c1m, &pp);
+            out.push((name.into(), t.elapsed().as_secs_f64() * 1e3));
+            for p in parsed.iter_mut() {
+                p.arena.free();
+            }
+        }
+    }
     let bdir = out_dir.join("_bench");
     let mut tctx: Option<Ctx> = None;
     for (round, threads) in [(0usize, nthreads), (1, nthreads), (2, (nthreads / 2).max(1))] {
