@@ -3,7 +3,7 @@
 //! ever linked under a root with a byte-wise smaller ID, so there are no
 //! cycles and every set's root is its smallest ID: the person's name.
 
-use crate::ids::cmp_key;
+use crate::ids::{cmp_ids, SLOW_BIT};
 use crate::sys;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -13,6 +13,7 @@ const K2: u64 = 0xD6E8_FEB8_6659_FD93;
 pub struct PersonTable {
     slots: &'static [[AtomicU64; 2]], // (key, person name); key 0 = empty
     parent: &'static [AtomicU32],     // 0 = root, else parent + 1
+    strs: &'static [AtomicU64],       // where a hashed key's bytes are (0 for packed keys)
     shift: u32,
     mask: usize,
 }
@@ -23,7 +24,8 @@ impl PersonTable {
         debug_assert!(cap % 4 == 0);
         let slots = unsafe { std::slice::from_raw_parts(sys::anon(cap * 16, true) as *const [AtomicU64; 2], cap) };
         let parent = unsafe { std::slice::from_raw_parts(sys::anon(cap * 4, true) as *const AtomicU32, cap) };
-        PersonTable { slots, parent, shift: 64 - (cap / 4).trailing_zeros(), mask: cap - 1 }
+        let strs = unsafe { std::slice::from_raw_parts(sys::anon(cap * 8, true) as *const AtomicU64, cap) };
+        PersonTable { slots, parent, strs, shift: 64 - (cap / 4).trailing_zeros(), mask: cap - 1 }
     }
 
     /// First slot of the key's bucket (4 slots, one cache line).
@@ -65,34 +67,58 @@ impl PersonTable {
     pub fn person(&self, k: u64) -> u64 {
         let mut i = self.slot(k);
         loop {
-            let b = unsafe { &*(self.slots.as_ptr().add(i) as *const [u64; 8]) };
-            let (m0, m1, m2, m3) = ((b[0] == k) as u64, (b[2] == k) as u64, (b[4] == k) as u64, (b[6] == k) as u64);
-            let v = (b[1] & m0.wrapping_neg()) | (b[3] & m1.wrapping_neg()) | (b[5] & m2.wrapping_neg()) | (b[7] & m3.wrapping_neg());
-            let found = m0 | m1 | m2 | m3;
-            if (found | (b[6] == 0) as u64) != 0 {
-                return v | (k & found.wrapping_sub(1));
+            // names are never 0, so a zero value means "not in this bucket"
+            let (_, v, full) = unsafe { probe_bucket(self.slots.as_ptr().add(i) as *const u64, k) };
+            let missing = (v == 0) as u64;
+            if (missing & full as u64) == 0 {
+                return v | (k & missing.wrapping_neg());
             }
             i = (i + 4) & self.mask;
         }
     }
 
-    /// Returns (slot, newly inserted by this call).
+    /// Returns (slot, newly inserted by this call). `loc` says where the ID's
+    /// bytes are; every caller records it for a hashed key before using the
+    /// slot, so it is set by the time anyone compares through this slot.
     #[inline]
-    fn insert(&self, k: u64) -> (usize, bool) {
+    fn insert(&self, k: u64, loc: u64) -> (usize, bool) {
         let mut i = self.slot(k);
         loop {
             for j in i..i + 4 {
                 let s = &self.slots[j][0];
                 let x = s.load(Relaxed);
+                let (hit, new) = if x == k {
+                    (true, false)
+                } else if x == 0 {
+                    match s.compare_exchange(0, k, Relaxed, Relaxed) {
+                        Ok(_) => (true, true),
+                        Err(y) => (y == k, false),
+                    }
+                } else {
+                    (false, false)
+                };
+                if hit {
+                    if k & SLOW_BIT != 0 && self.strs[j].load(Relaxed) == 0 {
+                        self.strs[j].store(loc, Relaxed);
+                    }
+                    return (j, new);
+                }
+            }
+            i = (i + 4) & self.mask;
+        }
+    }
+
+    /// Where the bytes of a hashed key in the table are, if it is in the table.
+    pub fn name_loc(&self, k: u64) -> Option<u64> {
+        let mut i = self.slot(k);
+        loop {
+            for j in i..i + 4 {
+                let x = self.slots[j][0].load(Relaxed);
                 if x == k {
-                    return (j, false);
+                    return Some(self.strs[j].load(Relaxed));
                 }
                 if x == 0 {
-                    match s.compare_exchange(0, k, Relaxed, Relaxed) {
-                        Ok(_) => return (j, true),
-                        Err(y) if y == k => return (j, false),
-                        Err(_) => {}
-                    }
+                    return None;
                 }
             }
             i = (i + 4) & self.mask;
@@ -124,7 +150,8 @@ impl PersonTable {
                 return;
             }
             let (ka, kb) = (self.slots[ra][0].load(Relaxed), self.slots[rb][0].load(Relaxed));
-            let (lo, hi) = if cmp_key(ka, kb) == Ordering::Less { (ra, rb) } else { (rb, ra) };
+            let (la, lb) = (self.strs[ra].load(Relaxed), self.strs[rb].load(Relaxed));
+            let (lo, hi) = if cmp_ids(ka, la, kb, lb) == Ordering::Less { (ra, rb) } else { (rb, ra) };
             if self.parent[hi].compare_exchange(0, lo as u32 + 1, Relaxed, Relaxed).is_ok() {
                 return;
             }
@@ -132,7 +159,7 @@ impl PersonTable {
     }
 
     /// Builds the table from link pairs (one Vec per producer), with `n` threads.
-    pub fn build(pairs: &[Vec<(u64, u64)>], n: usize) -> PersonTable {
+    pub fn build(pairs: &[Vec<(u64, u64, u64, u64)>], n: usize) -> PersonTable {
         let total: usize = pairs.iter().map(|v| v.len()).sum();
         let t0 = std::time::Instant::now();
         let t = PersonTable::new(total * 3 / 2 + 16);
@@ -152,13 +179,13 @@ impl PersonTable {
                             let sl = &pairs[v][st..(st + JOB).min(pairs[v].len())];
                             // 1. insert both ends (table misses hidden by prefetch)
                             ids.clear();
-                            for (i, &(a, b)) in sl.iter().enumerate() {
-                                if let Some(&(c, d)) = sl.get(i + 8) {
+                            for (i, &(a, la, b, lb)) in sl.iter().enumerate() {
+                                if let Some(&(c, _, d, _)) = sl.get(i + 8) {
                                     t.prefetch(c);
                                     t.prefetch(d);
                                 }
-                                let (ia, na) = t.insert(a);
-                                let (ib, nb) = t.insert(b);
+                                let (ia, na) = t.insert(a, la);
+                                let (ib, nb) = t.insert(b, lb);
                                 if na {
                                     mine.push(ia as u32);
                                 }
@@ -208,4 +235,35 @@ impl PersonTable {
         }
         t
     }
+}
+
+/// Looks for `k` among the four (key, value) pairs of a bucket: (found, value,
+/// bucket is full). No data-dependent branches.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn probe_bucket(b: *const u64, k: u64) -> (bool, u64, bool) {
+    use std::arch::x86_64::*;
+    let kk = _mm256_set1_epi64x(k as i64);
+    let even = _mm256_setr_epi64x(-1, 0, -1, 0);
+    let x = _mm256_loadu_si256(b as *const __m256i);
+    let y = _mm256_loadu_si256(b.add(4) as *const __m256i);
+    let mx = _mm256_and_si256(_mm256_cmpeq_epi64(x, kk), even);
+    let my = _mm256_and_si256(_mm256_cmpeq_epi64(y, kk), even);
+    // move each key's mask onto its value lane, keep the matching value
+    let vx = _mm256_and_si256(x, _mm256_slli_si256(mx, 8));
+    let vy = _mm256_and_si256(y, _mm256_slli_si256(my, 8));
+    let v = _mm256_or_si256(vx, vy);
+    let v128 = _mm_or_si128(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    let value = _mm_extract_epi64(v128, 1) as u64;
+    let found = _mm256_testz_si256(_mm256_or_si256(mx, my), _mm256_or_si256(mx, my)) == 0;
+    (found, value, *b.add(6) != 0)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn probe_bucket(b: *const u64, k: u64) -> (bool, u64, bool) {
+    let b = &*(b as *const [u64; 8]);
+    let (m0, m1, m2, m3) = ((b[0] == k) as u64, (b[2] == k) as u64, (b[4] == k) as u64, (b[6] == k) as u64);
+    let v = (b[1] & m0.wrapping_neg()) | (b[3] & m1.wrapping_neg()) | (b[5] & m2.wrapping_neg()) | (b[7] & m3.wrapping_neg());
+    ((m0 | m1 | m2 | m3) != 0, v, b[6] != 0)
 }

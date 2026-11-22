@@ -23,7 +23,7 @@ mod sys;
 mod ts;
 
 use buf::{Arena, Streams};
-use ids::{cmp_key, id_key, id_key_slice, key_bytes};
+use ids::{cmp_click, id_key, id_key_slice, locator, SLOW_BIT};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -72,6 +72,14 @@ impl U64Map {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
         U64Map { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
+    }
+    /// Empties the map and makes room for `n` keys, keeping its memory.
+    fn reset(&mut self, n: usize) {
+        let cap = (n * 2).next_power_of_two().max(16);
+        self.slots.clear();
+        self.slots.resize(cap, (0, 0));
+        self.shift = 64 - cap.trailing_zeros();
+        self.mask = cap - 1;
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
@@ -272,6 +280,7 @@ fn run_threads<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 struct LR {
     ek: u64,
     uk: u64,
+    uloc: u64, // where the user ID's bytes are in the mapped file
     ingest: u32,
     ts: u32,
     pay: u32,
@@ -343,10 +352,19 @@ struct Ctx {
     bbits: u32,
 }
 
+/// Where to read the name of a person whose ID is a hashed key.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct NS {
+    person: u64,
+    loc: u64,
+}
+
 struct Parsed {
     es: Streams<ER>,
     ss: Streams<SR>,
     cs: Streams<CR>,
+    ns: Streams<NS>,
     arena: Arena,
 }
 
@@ -569,7 +587,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     let mut lchunks = Vec::new();
     make_chunks(&maps[nev + nck..], nev + nck, 2, 256 << 10, &mut lchunks);
     let next = AtomicUsize::new(0);
-    let pairs: Vec<Vec<(u64, u64)>> = run_threads(nthreads, |_| {
+    let pairs: Vec<Vec<(u64, u64, u64, u64)>> = run_threads(nthreads, |_| {
         let mut v = Vec::new();
         let mut ix = scan2::Index::new();
         loop {
@@ -584,7 +602,8 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
                 if s0 == e0 || s1 == e1 {
                     return;
                 }
-                v.push((key_at(b, s0, e0), key_at(b, s1, e1)));
+                let (la, lb) = unsafe { (locator(b.as_ptr().add(s0), e0 - s0), locator(b.as_ptr().add(s1), e1 - s1)) };
+                v.push((key_at(b, s0, e0), la, key_at(b, s1, e1), lb));
             });
         }
         v
@@ -625,7 +644,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     let csize = envu("CHUNK").unwrap_or(1 << 20);
     make_chunks(&maps[..nev], 0, 0, csize, &mut chunks);
     make_chunks(&maps[nev..nev + nck], nev, 1, csize, &mut chunks);
-    let arena_cap = ev_bytes / 36 * 32 + ck_bytes / 20 * 24 + (2 * np + nb) * BLOCK * 24 + (16 << 20);
+    let arena_cap = ev_bytes / 36 * 48 + ck_bytes / 20 * 24 + (3 * np + nb) * BLOCK * 24 + (16 << 20);
     let pp = PP {
         sub: envu("SUB").unwrap_or(16 << 10),
         pbits: ctx.pbits,
@@ -644,7 +663,6 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     // Unmap the inputs now, in parallel: at exit this would be done by one thread.
     if unmap && !pp.pread {
         const STEP: usize = 16 << 20;
-        let drop_only = std::env::var("MUNMAP").is_err();
         let mut jobs: Vec<(usize, usize)> = Vec::new();
         for m in maps {
             let len = (m.len + 4095) & !4095;
@@ -659,11 +677,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         run_threads(nthreads, |_| loop {
             let k = next.fetch_add(1, Relaxed);
             let Some(&(p, n)) = jobs.get(k) else { break };
-            if drop_only {
-                sys::drop_pages(p as *const u8, n);
-            } else {
-                sys::unmap(p as *const u8, n);
-            }
+            sys::drop_pages(p as *const u8, n);
         });
         log("inputs unmapped");
     }
@@ -731,6 +745,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
         let mut es: Streams<ER> = Streams::new(np, pp.block, pp.nt);
         let mut ss: Streams<SR> = Streams::new(nb, pp.block, pp.nt);
         let mut cs: Streams<CR> = Streams::new(np, pp.block, false);
+        let mut ns: Streams<NS> = Streams::new(np, pp.block, false);
         let mut lr: Vec<LR> = Vec::with_capacity(1 << 12);
         let mut lc: Vec<LC> = Vec::with_capacity(1 << 12);
         let mut ix = scan2::Index::new();
@@ -743,7 +758,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
         loop {
             let k = next.fetch_add(1, Relaxed);
             let Some(c) = chunks.get(k) else { break };
-            let (b, cstart, cend): (&[u8], usize, usize) = if pp.pread {
+            let (b, cstart, cend): (&[u8], usize, usize) = if pp.pread && pp.mode != 0 {
                 let len = c.end - c.start;
                 if rbuf.len() < len + 128 {
                     rbuf.resize(len + 128, b'\n');
@@ -770,6 +785,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                 {
                 // The decoders read a little outside each field: a piece too near
                 // either end of its buffer is parsed from a padded copy instead.
+                let orig = unsafe { b.as_ptr().add(pos) };
                 let (b, pos, sub_end): (&[u8], usize, usize) = if pos >= 64 && sub_end + 64 <= b.len() {
                     (b, pos, sub_end)
                 } else {
@@ -780,6 +796,8 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                     pad.resize(64 + n + 64, 0);
                     (&pad[..64 + n], 64, 64 + n)
                 };
+                // from a pointer into the parsed buffer to the same byte of the mapped file
+                let adj = orig as isize - unsafe { b.as_ptr().add(pos) } as isize;
                 let _ = sub_end;
                 let q0 = if timing { Some(Instant::now()) } else { None };
                 if pp.mode == 1 {
@@ -787,10 +805,10 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                     sink += ix.sep[0] as u64;
                 } else if events {
                     lr.clear();
-                    parse_events(ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lr);
+                    parse_events(ctx, b, pos, sub_end, adj, &mut ix, &mut dc, &mut lr);
                     let q1 = if timing { Some(Instant::now()) } else { None };
                     if pp.mode == 0 {
-                        emit_events(ctx, &lr, &mut es, &mut ss, &mut arena, pp);
+                        emit_events(ctx, &lr, &mut es, &mut ss, &mut ns, &mut arena, pp);
                     } else {
                         sink += lr.len() as u64;
                     }
@@ -800,7 +818,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                     }
                 } else {
                     lc.clear();
-                    parse_clicks(ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lc);
+                    parse_clicks(ctx, b, pos, sub_end, adj, &mut ix, &mut dc, &mut lc);
                     let q1 = if timing { Some(Instant::now()) } else { None };
                     if pp.mode == 0 {
                         emit_clicks(ctx, &lc, &mut cs, &mut arena, pp);
@@ -822,7 +840,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
         if timing {
             eprintln!("  parse thread: ev scan {:.1} emit {:.1} | ck scan {:.1} emit {:.1} ms", tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3);
         }
-        Parsed { es, ss, cs, arena }
+        Parsed { es, ss, cs, ns, arena }
     })
 }
 
@@ -845,7 +863,7 @@ fn sub_chunk(b: &[u8], start: usize, end: usize, w: usize) -> usize {
 /// Parses the event rows of `b[start..end]`. The caller guarantees 64 readable
 /// bytes before `start` and after `end`.
 #[inline(always)]
-fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lr: &mut Vec<LR>) {
+fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lr: &mut Vec<LR>) {
     scan2::index(b, start, end, ix);
     let base = unsafe { b.as_ptr().add(start) };
     let (ws_rel, we_rel, cbase, base_s) = (ctx.ws_rel as i64, ctx.we_rel as i64, ctx.base, ctx.base_s);
@@ -861,7 +879,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
             Some(ms) => (ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             None => u32::MAX,
         };
-        let mut e = LR { ek, uk: 0, ingest, ts: 0, pay: 0, valid: 0 };
+        let mut e = LR { ek, uk: 0, uloc: 0, ingest, ts: 0, pay: 0, valid: 0 };
         'v: {
             let (p1, l1) = fld!(base, rs, q, 1);
             let (p5, l5) = fld!(base, rs, q, 5);
@@ -891,6 +909,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
             }
             e.ts = rel as u32;
             e.uk = id_key(p1, l1);
+            e.uloc = locator(p1.offset(adj), l1);
             e.valid = 1;
         }
         lr.push(e);
@@ -900,7 +919,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
 const PF: usize = 12;
 
 #[inline(always)]
-fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>, arena: &mut Arena, pp: &PP) {
+fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>, ns: &mut Streams<NS>, arena: &mut Arena, pp: &PP) {
     let base = arena.base() as usize;
     for (i, e) in lr.iter().enumerate() {
         if let Some(x) = lr.get(i + pp.pf) {
@@ -909,8 +928,13 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
         let mut loc = NONE;
         if e.valid != 0 {
             let person = ctx.person.person(e.uk);
-            let p = es.push(top_bits(person, pp.pbits), ER { person, ts: e.ts, pay: e.pay }, arena);
+            let part = top_bits(person, pp.pbits);
+            let p = es.push(part, ER { person, ts: e.ts, pay: e.pay }, arena);
             loc = ((p as usize - base) / 16) as u32;
+            // a person named by this very (hashed) ID: remember where its bytes are
+            if person == e.uk && person & SLOW_BIT != 0 {
+                ns.push(part, NS { person, loc: e.uloc }, arena);
+            }
         }
         ss.push(top_bits(e.ek, pp.bbits), SR { ek: e.ek, ingest: e.ingest, loc }, arena);
     }
@@ -918,7 +942,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
 
 /// Parses the click rows of `b[start..end]`; same padding guarantee as `parse_events`.
 #[inline(always)]
-fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lc: &mut Vec<LC>) {
+fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lc: &mut Vec<LC>) {
     scan2::index(b, start, end, ix);
     let base = unsafe { b.as_ptr().add(start) };
     scan2::rows::<4>(ix, |rs, q| unsafe {
@@ -935,7 +959,7 @@ fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::I
             return;
         }
         let Some(camp) = ctx.lk.camp.get(id_key(p2, l2)) else { return };
-        lc.push(LC { uk: id_key(p1, l1), ck: id_key(p0, l0), ts: rel as u32, camp: camp as u32 });
+        lc.push(LC { uk: id_key(p1, l1), ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
     });
 }
 
@@ -1076,17 +1100,6 @@ fn as_bytes<T>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-/// The bytes of a packed (non-interned) key, first byte lowest, and their count.
-#[inline(always)]
-fn unpack_key(key: u64) -> (u64, u8, usize) {
-    let len = 9 - (key.trailing_zeros() / 7).min(8) as usize;
-    let mut x = key >> 7;
-    x = ((x & 0x00FF_FFFF_F000_0000) << 4) | (x & 0x0000_0000_0FFF_FFFF);
-    x = ((x & 0x0FFF_C000_0FFF_C000) << 2) | (x & 0x0000_3FFF_0000_3FFF);
-    x = ((x & 0x3F80_3F80_3F80_3F80) << 1) | (x & 0x007F_007F_007F_007F);
-    (x.swap_bytes(), (key & 0x7F) as u8, len)
-}
-
 impl UdWriter {
     fn new(path: PathBuf) -> Self {
         UdWriter {
@@ -1104,9 +1117,9 @@ impl UdWriter {
         }
     }
     #[inline(always)]
-    fn push(&mut self, person: u64, day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
-        if person & ids::SLOW_BIT == 0 && self.uid.capacity() - self.uid.len() >= 16 {
-            let (lo, ninth, len) = unpack_key(person);
+    fn push(&mut self, person: u64, nloc: u64, day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
+        if person & SLOW_BIT == 0 && self.uid.capacity() - self.uid.len() >= 16 {
+            let (lo, ninth, len) = ids::unpack_key(person);
             unsafe {
                 let p = self.uid.as_mut_ptr().add(self.uid.len());
                 (p as *mut u32).write_unaligned(len as u32);
@@ -1116,7 +1129,7 @@ impl UdWriter {
             }
         } else {
             let mut tmp = Vec::new();
-            key_bytes(person, &mut tmp);
+            ids::id_bytes(person, nloc, &mut tmp);
             put_str(&mut self.uid, &tmp);
         }
         let n = self.n;
@@ -1190,6 +1203,7 @@ struct Scratch {
     dcat: Vec<i64>,
     camp: Vec<[i64; 2]>, // (sessions | purchasing << 32, revenue) per (campaign, day)
     asst: Vec<u32>,      // assisted sessions per (campaign, day)
+    nmap: U64Map,        // hashed person key -> where its bytes are
     #[allow(dead_code)]
     tsc: [u64; 8],
 }
@@ -1212,6 +1226,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         dcat: vec![0; ctx.nd * ctx.ncats],
         camp: vec![[0i64; 2]; (ctx.ncamp + 1) * ctx.nd],
         asst: vec![0u32; (ctx.ncamp + 1) * ctx.nd],
+        nmap: U64Map::new(16),
         tsc: [0; 8],
     };
     let mut out = UdWriter::new(ud_dir.join(format!("part-{tid:03}.parquet")));
@@ -1229,6 +1244,15 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         let n_all: usize = parsed.iter().map(|t| t.es.len(p)).sum();
         if n_all == 0 {
             continue;
+        }
+        let n_names: usize = parsed.iter().map(|t| t.ns.len(p)).sum();
+        sc.nmap.reset(n_names);
+        for t in parsed {
+            t.ns.for_slices(p, |sl| {
+                for r in sl {
+                    sc.nmap.insert(r.person, r.loc);
+                }
+            });
         }
         let nsub = (n_all / 8).next_power_of_two().clamp(16, 1 << 16);
         let sbits = nsub.trailing_zeros();
@@ -1469,6 +1493,16 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
     let nsess = sc.sess.len() as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut cur = sc.sess[0].di;
+    // a hashed person key needs its bytes: seen with an event of this
+    // partition, or else it is a linked ID
+    let nloc = if person & SLOW_BIT != 0 {
+        match sc.nmap.get(person) {
+            Some(l) => l,
+            None => ctx.person.name_loc(person).expect("name of a linked person"),
+        }
+    } else {
+        0
+    };
     let (mut d_sessions, mut d_events, mut d_rev, mut d_pur) = (0u32, 0u32, 0i64, 0u32);
     // A campaign is "active" while one of its clicks is within the 7 days before
     // the current session. `since[c]` is the first session it assisted that is
@@ -1477,7 +1511,7 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
     for ord in 0..nsess {
         let s = sc.sess[ord as usize];
         if s.di != cur {
-            flush_day(ctx, person, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+            flush_day(ctx, person, nloc, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
             for &c in &sc.active {
                 let c = c as usize;
                 sc.asst[c * nd + cur as usize] += ord - sc.since[c];
@@ -1527,7 +1561,7 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
                 let mut k = hi - 1;
                 while k > lo && cl[k - 1].0 == lt {
                     k -= 1;
-                    if cmp_key(cl[k].2, cl[best].2) == Ordering::Less {
+                    if cmp_click(cl[k].2, cl[best].2) == Ordering::Less {
                         best = k;
                     }
                 }
@@ -1538,7 +1572,7 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
         a[0] += 1 + (((s.purchases > 0) as i64) << 32);
         a[1] += s.rev;
     }
-    flush_day(ctx, person, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+    flush_day(ctx, person, nloc, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
     for i in 0..sc.active.len() {
         let c = sc.active[i] as usize;
         sc.asst[c * nd + cur as usize] += nsess - sc.since[c];
@@ -1549,7 +1583,7 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
 
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn flush_day(ctx: &Ctx, person: u64, di: u32, sessions: u32, events: u32, revenue: i64, purchases: u32, dcat: &mut [i64], out: &mut UdWriter) {
+fn flush_day(ctx: &Ctx, person: u64, nloc: u64, di: u32, sessions: u32, events: u32, revenue: i64, purchases: u32, dcat: &mut [i64], out: &mut UdWriter) {
     let mut top: Option<&[u8]> = None;
     if purchases > 0 {
         let row = &mut dcat[di as usize * ctx.ncats..(di as usize + 1) * ctx.ncats];
@@ -1564,7 +1598,7 @@ fn flush_day(ctx: &Ctx, person: u64, di: u32, sessions: u32, events: u32, revenu
         }
         top = Some(&ctx.lk.cat_names[bi]);
     }
-    out.push(person, (ctx.day0 + di as i64) as i32, sessions, events, revenue, top);
+    out.push(person, nloc, (ctx.day0 + di as i64) as i32, sessions, events, revenue, top);
 }
 
 fn put_str(v: &mut Vec<u8>, s: &[u8]) {
@@ -1679,7 +1713,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         make_chunks(&tiled[..tnev], 0, 0, 1 << 20, &mut c1m);
         make_chunks(&tiled[tnev..tnev + tnck], tnev, 1, 1 << 20, &mut c1m);
         let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
-        let pp = PP { sub: 16 << 10, pbits: _ctx.pbits.max(9), bbits: _ctx.bbits.max(9), mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
+        let fm = std::env::var("FIRSTMODE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+        let pp = PP { sub: 16 << 10, pbits: _ctx.pbits.max(9), bbits: _ctx.bbits.max(9), mode: fm, pread: false, huge: std::env::var("FIRSTNOHUGE").is_err(), block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
         for name in ["first", "second"] {
             let t = Instant::now();
             let mut parsed = parse_phase(_ctx, &tiled, files, &c1m, &pp);
