@@ -63,7 +63,8 @@ impl Arena {
     }
 }
 
-pub static AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub static AHEAD_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
 /// Bytes in a stream block.
 pub const BB: usize = 4096;
@@ -105,10 +106,16 @@ impl<T: Copy> Streams<T> {
             }
             let p = (self.base + at as usize) as *mut T;
             p.write(v);
-            // benchmark knob: ask for the stream's next line at every push
-            if cfg!(feature = "selfbench") && AHEAD.load(std::sync::atomic::Ordering::Relaxed) {
+            // The stream comes back to this spot a thousand pushes from now. Ask
+            // for its next line today: fetching a fresh line from memory at the
+            // moment of the write holds up every store behind it. (Measured on
+            // the scoring machine; a knob only in benchmark builds.)
+            if !cfg!(feature = "selfbench") || AHEAD.load(std::sync::atomic::Ordering::Relaxed) {
                 #[cfg(target_arch = "x86_64")]
-                std::arch::x86_64::_mm_prefetch((p as *const i8).add(64), std::arch::x86_64::_MM_HINT_T0);
+                {
+                    let d = if cfg!(feature = "selfbench") { AHEAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) } else { 64 };
+                    std::arch::x86_64::_mm_prefetch((p as *const i8).add(d), std::arch::x86_64::_MM_HINT_T0);
+                }
             }
             *self.pos.get_unchecked_mut(s) = at + std::mem::size_of::<T>() as u32;
             p

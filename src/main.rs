@@ -265,10 +265,7 @@ fn run_threads<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..n).map(|t| {
             let f = &f;
-            s.spawn(move || {
-                sys::pin(t);
-                f(t)
-            })
+            s.spawn(move || f(t))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
@@ -566,7 +563,6 @@ fn main() {
     log(&t0, &format!("mapped {} event files {} B, {} click files {} B, {} link files", nev, ev_bytes, nck, ck_bytes, ln_files.len()));
 
     dirs.join().unwrap();
-    sys::PIN.store(std::env::var("PIN").is_ok(), Relaxed);
     let unmap = std::env::var("KEEP_MAPS").is_err() && !cfg!(feature = "selfbench");
     let ctx = pipeline(&maps, &files, nev, nck, ws, we, move || lookups.join().unwrap(), &out, nthreads, unmap, &|w: &str| log(&t0, w));
     #[cfg(feature = "selfbench")]
@@ -943,7 +939,9 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
             e.uk = id_key(p1, l1);
             // ask for the person-table line now: the scatter that follows this
             // sub-chunk then finds it in the cache instead of waiting in line
-            ctx.person.prefetch(e.uk);
+            if !cfg!(feature = "selfbench") || DEC_PF.load(Relaxed) {
+                ctx.person.prefetch(e.uk);
+            }
             e.uloc = locator(p1.offset(adj), l1);
             e.valid = 1;
         }
@@ -1740,6 +1738,7 @@ fn tile_ids(buf: &mut [u8], k: usize) {
 /// Times the whole pipeline on the inputs tiled with distinct IDs, at about
 /// 60M and 20M events, for several partition counts; then the parse phase on
 /// fresh file mappings against anonymous copies. Returns text rows.
+static DEC_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 #[cfg(feature = "selfbench")]
 static PREFAULT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "selfbench")]
@@ -1794,7 +1793,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
     let bdir = out_dir.join("_bench");
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
-    let runs: [(&str, usize, u32, u32); 5] = [("Sa", small, 0, 0), ("Pa", small, 0, 0), ("Sb", small, 0, 0), ("Pb", small, 0, 0), ("Sa3", small, 0, 0)];
+    let runs: [(&str, usize, u32, u32); 3] = [("Sa", small, 0, 0), ("Sb", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1811,7 +1810,6 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
-        sys::PIN.store(label.starts_with('P'), Relaxed);
         let t = Instant::now();
         let marks: std::sync::Mutex<([(u16, f64); 16], usize)> = std::sync::Mutex::new(([(0, 0.0); 16], 0));
         let d2 = data.to_path_buf();
@@ -1823,7 +1821,6 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 g.1 = n + 1;
             }
         });
-        sys::PIN.store(false, Relaxed);
         let keep = label == "Sa3";
         if keep {
             last = Some(c);
@@ -1860,22 +1857,29 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         make_chunks(&tiled[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch_ck);
         // the share of the arenas each thread fills, with room to spare
         let share = ((ev_bytes / 85 * 32 + ck_bytes / 60 * 24) * small / nthreads) * 3 / 2 + (32 << 20);
-        for (name, mode, chs, ahead, pin, pf) in [("full", 0u8, &ch, false, false, PF), ("fullA", 0, &ch, true, false, PF), ("fullP", 0, &ch, false, true, PF), ("fullN", 0, &ch, false, false, 9999), ("dec", 2, &ch, false, false, PF), ("decev", 2, &ch_ev, false, false, PF), ("fullev", 0, &ch_ev, false, false, PF), ("fullevA", 0, &ch_ev, true, false, PF), ("fullevN", 0, &ch_ev, false, false, 9999), ("full2", 0, &ch, false, false, PF), ("fullA2", 0, &ch, true, false, PF), ("fullP2", 0, &ch, false, true, PF)] {
-            let mut best = f64::MAX;
-            buf::AHEAD.store(ahead, Relaxed);
-            sys::PIN.store(pin, Relaxed);
-            for _ in 0..2 {
-                let t = Instant::now();
-                let mut parsed = parse_phase(&tctx, &tiled, files, chs, &PP { mode, pf, ..base });
-                best = best.min(t.elapsed().as_secs_f64() * 1e3);
-                for p in parsed.iter_mut() {
-                    p.arena.free();
+        // (name, next-line request distance or 0, scatter lookahead, table request while decoding)
+        let vars: [(&str, usize, usize, bool); 6] = [("no", 0, PF, true), ("a64", 64, PF, true), ("a128", 128, PF, true), ("a64n", 64, 9999, true), ("a64d", 64, PF, false), ("a192", 192, PF, true)];
+        for round in 0..2 {
+            for (name, ahead, pf, decpf) in vars {
+                buf::AHEAD.store(ahead > 0, Relaxed);
+                buf::AHEAD_BYTES.store(ahead.max(64), Relaxed);
+                DEC_PF.store(decpf, Relaxed);
+                let mut best = f64::MAX;
+                for _ in 0..2 {
+                    let t = Instant::now();
+                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { pf, ..base });
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                    for p in parsed.iter_mut() {
+                        p.arena.free();
+                    }
                 }
+                out.push((format!("{name}{round}"), best));
             }
-            buf::AHEAD.store(false, Relaxed);
-            sys::PIN.store(false, Relaxed);
-            out.push((name.to_string(), best));
         }
+        buf::AHEAD.store(true, Relaxed);
+        buf::AHEAD_BYTES.store(64, Relaxed);
+        DEC_PF.store(true, Relaxed);
+        let _ = (&ch_ev, &ch_ck);
         let _ = share;
         std::mem::forget(tctx);
     }
