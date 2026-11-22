@@ -671,10 +671,6 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         pf: envu("PFD").unwrap_or(PF),
         arena_cap,
         nt: envu("NT").is_some(),
-        pair: {
-            PAIR_STRICT.store(envu("PAIR") == Some(2), Relaxed);
-            envu("PAIR").is_some_and(|v| v != 0) // off unless asked: no gain measured yet
-        },
     };
     let parsed: Vec<Parsed> = parse_phase(&ctx, maps, files, &chunks, &pp);
     log("parsed");
@@ -696,6 +692,8 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &order, &ud_dir, t));
     }
     let results: Vec<(Vec<[i64; 4]>, usize)> = run_threads(nthreads, |t| sessionize_worker(&ctx, &parsed, &next, &order, &ud_dir, t));
+    #[cfg(feature = "prof")]
+    eprintln!("  walk Mcycles (all threads): flush_day packed {} clicks {} flush_day slow {}", WALKT[0].load(Relaxed) / 1_000_000, WALKT[1].load(Relaxed) / 1_000_000, WALKT[2].load(Relaxed) / 1_000_000);
     log("sessionized");
 
     let mut camp_tot = vec![[0i64; 4]; (ncamp + 1) * nd];
@@ -760,40 +758,12 @@ struct PP {
     pf: usize,
     arena_cap: usize,
     nt: bool, // write-combining, non-temporal scatter
-    pair: bool, // hyperthread siblings split decoding and scattering
-}
-
-/// A decoded piece of input waiting to be scattered.
-struct Batch {
-    events: bool,
-    lr: Vec<LR>,
-    lc: Vec<LC>,
-}
-
-/// What the workers on one physical core share: who is decoding, and the
-/// decoded pieces not yet scattered.
-#[repr(align(64))]
-struct CoreQ {
-    busy: std::sync::atomic::AtomicBool,
-    len: AtomicUsize,
-    q: std::sync::Mutex<Vec<Batch>>,
-    pool: std::sync::Mutex<Vec<Batch>>,
 }
 
 fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks: &[Chunk], pp: &PP) -> Vec<Parsed> {
     use std::os::unix::fs::FileExt;
     let next = AtomicUsize::new(0);
     let (np, nb) = (1usize << pp.pbits, 1usize << pp.bbits);
-    // Decoding wants the whole core and scattering mostly waits for memory, so
-    // on a core with two hyperthreads one worker decodes while the other
-    // scatters what it decoded. Nobody is pinned: each worker asks where it is
-    // running before every piece of work.
-    let (topo, ncores) = sys::cpu_cores();
-    let pair = pp.pair && pp.mode == 0 && !pp.pread && ncores > &0 && cfg!(target_os = "linux");
-    let cores: Vec<CoreQ> = (0..if pair { *ncores } else { 0 })
-        .map(|_| CoreQ { busy: std::sync::atomic::AtomicBool::new(false), len: AtomicUsize::new(0), q: std::sync::Mutex::new(Vec::new()), pool: std::sync::Mutex::new(Vec::new()) })
-        .collect();
-    let active = AtomicUsize::new(0);
     run_threads(pp.threads, |_| {
         let mut arena = Arena::new(if pp.mode == 0 || pp.mode >= 4 { pp.arena_cap } else { 4096 }, pp.huge);
         #[cfg(feature = "selfbench")]
@@ -826,112 +796,7 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
         let timing = prof();
         let mut tm = [0f64; 4];
         let mut sink = 0u64;
-        if pair {
-            const LIMIT: usize = 3; // decoded pieces a core lets wait
-            let strict = PAIR_STRICT.load(Relaxed);
-            let pop = |o: &CoreQ| -> Option<Batch> {
-                let b = o.q.lock().unwrap().pop();
-                if b.is_some() {
-                    o.len.fetch_sub(1, Relaxed);
-                }
-                b
-            };
-            let mut cur: Option<(usize, usize)> = None; // my chunk, and how far into it
-            let mut idle = 0u32;
-            loop {
-                let cq = &cores[topo.get(sys::current_cpu()).copied().unwrap_or(0) as usize % cores.len()];
-                let backlog = cq.len.load(Relaxed);
-                if backlog < LIMIT {
-                    // decode as this core's decoder, or because there is nothing to scatter
-                    let got = cq.busy.compare_exchange(false, true, Relaxed, Relaxed).is_ok();
-                    let mut decoded = false;
-                    if got || (backlog == 0 && !strict) {
-                        active.fetch_add(1, Relaxed);
-                        if cur.is_none() {
-                            let k = next.fetch_add(1, Relaxed);
-                            if k < chunks.len() {
-                                cur = Some((k, chunks[k].start));
-                            }
-                        }
-                        if let Some((k, pos)) = cur {
-                            let c = &chunks[k];
-                            let b = maps[c.file as usize].bytes();
-                            let sub_end = sub_chunk(b, pos, c.end, pp.sub);
-                            let mut batch = cq.pool.lock().unwrap().pop().unwrap_or_else(|| Batch { events: true, lr: Vec::with_capacity(1 << 10), lc: Vec::with_capacity(1 << 10) });
-                            batch.events = c.kind == 0;
-                            batch.lr.clear();
-                            batch.lc.clear();
-                            {
-                                // a piece too near either end of its buffer is parsed from a padded copy
-                                let orig = unsafe { b.as_ptr().add(pos) };
-                                let (pb, p0, pe): (&[u8], usize, usize) = if pos >= 64 && sub_end + 64 <= b.len() {
-                                    (b, pos, sub_end)
-                                } else {
-                                    let n = sub_end - pos;
-                                    pad.clear();
-                                    pad.resize(64, b'\n');
-                                    pad.extend_from_slice(&b[pos..sub_end]);
-                                    pad.resize(64 + n + 64, 0);
-                                    (&pad[..64 + n], 64, 64 + n)
-                                };
-                                let adj = orig as isize - unsafe { pb.as_ptr().add(p0) } as isize;
-                                if batch.events {
-                                    parse_events(ctx, pb, p0, pe, adj, &mut ix, &mut dc, &mut batch.lr);
-                                } else {
-                                    parse_clicks(ctx, pb, p0, pe, adj, &mut ix, &mut dc, &mut batch.lc);
-                                }
-                            }
-                            cur = if sub_end < c.end { Some((k, sub_end)) } else { None };
-                            cq.q.lock().unwrap().push(batch);
-                            cq.len.fetch_add(1, Relaxed);
-                            decoded = true;
-                        }
-                        active.fetch_sub(1, Relaxed);
-                    }
-                    if got {
-                        cq.busy.store(false, Relaxed);
-                    }
-                    if decoded {
-                        idle = 0;
-                        continue;
-                    }
-                }
-                // scatter: this core's pieces first, then anyone's
-                let mut batch = if cq.len.load(Relaxed) > 0 { pop(cq) } else { None };
-                if batch.is_none() {
-                    for o in cores.iter() {
-                        if o.len.load(Relaxed) > 0 {
-                            batch = pop(o);
-                            if batch.is_some() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(bt) = batch {
-                    if bt.events {
-                        emit_events(ctx, &bt.lr, &mut es, &mut ss, &mut ns, &mut arena, pp);
-                    } else {
-                        emit_clicks(ctx, &bt.lc, &mut cs, &mut arena, pp);
-                    }
-                    cq.pool.lock().unwrap().push(bt);
-                    idle = 0;
-                    continue;
-                }
-                if cur.is_none() && next.load(Relaxed) >= chunks.len() && active.load(Relaxed) == 0 && cores.iter().all(|o| o.len.load(Relaxed) == 0) {
-                    break;
-                }
-                std::hint::spin_loop();
-                idle += 1;
-                if idle > 256 {
-                    std::thread::yield_now();
-                }
-            }
-        }
         loop {
-            if pair {
-                break;
-            }
             let k = next.fetch_add(1, Relaxed);
             let Some(c) = chunks.get(k) else { break };
             let (b, cstart, cend): (&[u8], usize, usize) = if pp.pread && pp.mode != 0 {
@@ -1039,6 +904,7 @@ fn sub_chunk(b: &[u8], start: usize, end: usize, w: usize) -> usize {
 #[inline(always)]
 fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lr: &mut Vec<LR>) {
     scan2::index(b, start, end, ix);
+    lr.reserve((end - start) / 13 + 1);
     let base = unsafe { b.as_ptr().add(start) };
     let (ws_rel, we_rel, cbase, base_s) = (ctx.ws_rel as i64, ctx.we_rel as i64, ctx.base, ctx.base_s);
     scan2::rows::<7>(ix, |rs, q| unsafe {
@@ -1050,6 +916,7 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
         let (p3, l3) = fld!(base, rs, q, 3);
         let ingest_ms = ts_p(p3, l3, dc);
         let ingest = match ingest_ms {
+            Some(ms) if ms >= 0 => ((ms as u64 / 1000) as i64 - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             Some(ms) => (ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             None => u32::MAX,
         };
@@ -1091,7 +958,10 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
             e.uloc = locator(p1.offset(adj), l1);
             e.valid = 1;
         }
-        lr.push(e);
+        // room for this was reserved up front: a row is at least 13 bytes
+        let n = lr.len();
+        lr.as_mut_ptr().add(n).write(e);
+        lr.set_len(n + 1);
     });
 }
 
@@ -1104,12 +974,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
     let m = if cfg!(feature = "selfbench") { pp.mode } else { 0 };
     let (do_look, do_er, do_sr) = (matches!(m, 0 | 4 | 7), matches!(m, 0 | 5 | 7), matches!(m, 0 | 6));
     let mut sink = 0u64;
-    for (i, e) in lr.iter().enumerate() {
-        if do_look && pp.pf < 4096 {
-            if let Some(x) = lr.get(i + pp.pf) {
-                ctx.person.prefetch(x.uk);
-            }
-        }
+    for e in lr.iter() {
         let mut loc = NONE;
         if e.valid != 0 {
             let person = if do_look { ctx.person.person(e.uk) } else { e.uk };
@@ -1135,6 +1000,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
 #[inline(always)]
 fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lc: &mut Vec<LC>) {
     scan2::index(b, start, end, ix);
+    lc.reserve((end - start) / 8 + 1);
     let base = unsafe { b.as_ptr().add(start) };
     scan2::rows::<4>(ix, |rs, q| unsafe {
         let (p0, l0) = fld!(base, rs, q, 0);
@@ -1152,18 +1018,16 @@ fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, adj: isize, ix: &
         let Some(camp) = ctx.lk.camp.get(id_key(p2, l2)) else { return };
         let uk = id_key(p1, l1);
         ctx.person.prefetch(uk);
-        lc.push(LC { uk, ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
+        // room for this was reserved up front: a row is at least 8 bytes
+        let n = lc.len();
+        lc.as_mut_ptr().add(n).write(LC { uk, ck: ids::click_word(p0, l0, p0.offset(adj)), ts: rel as u32, camp: camp as u32 });
+        lc.set_len(n + 1);
     });
 }
 
 #[inline(always)]
 fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena, pp: &PP) {
-    for (i, c) in lc.iter().enumerate() {
-        if pp.pf < 4096 {
-            if let Some(x) = lc.get(i + pp.pf) {
-                ctx.person.prefetch(x.uk);
-            }
-        }
+    for c in lc.iter() {
         let person = ctx.person.person(c.uk);
         cs.push(top_bits(person, pp.pbits), CR { person, ck: c.ck, ts: c.ts, camp: c.camp }, arena);
     }
@@ -1174,10 +1038,10 @@ fn emit_clicks(ctx: &Ctx, lc: &[LC], cs: &mut Streams<CR>, arena: &mut Arena, pp
 
 fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
     let mut b1: Vec<u64> = Vec::new();
-    let mut b2: Vec<u64> = Vec::new();
     let mut table: Vec<(u64, u32, u32, u32)> = Vec::new();
     let mut sus: Vec<(u64, u32, u32, u32)> = Vec::new();
     let mut killed = 0usize;
+    let mut dtm = [0f64; 3];
     let kill = |t: u32, loc: u32| {
         if loc != NONE {
             unsafe { (*(parsed[t as usize].arena.base() as *mut ER).add(loc as usize)).pay = DEAD };
@@ -1192,29 +1056,31 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
         if n == 0 {
             continue;
         }
+        // Two bits a slot in one bitmap, "seen" and "seen again": one word
+        // read and written per record.
         let mbits = (usize::BITS - (n * 16).leading_zeros()).max(10);
-        let words = 1usize << (mbits - 6);
+        let words = 1usize << (mbits - 5);
         b1.clear();
         b1.resize(words, 0);
-        b2.clear();
-        b2.resize(words, 0);
         let sh = 64 - mbits;
         let mut suspects = 0usize;
+        let d0 = Instant::now();
         for th in parsed {
             th.ss.for_slices_ahead(bkt, |sl| {
                 for r in sl {
                     let i = (r.ek.wrapping_mul(K2) >> sh) as usize;
-                    let (w, m) = (i >> 6, 1u64 << (i & 63));
+                    let (w, m) = (i >> 5, 1u64 << (2 * (i & 31)));
                     unsafe {
                         let x = *b1.get_unchecked(w);
-                        let hit = (x & m != 0) as u64;
-                        *b1.get_unchecked_mut(w) = x | m;
-                        *b2.get_unchecked_mut(w) |= m & hit.wrapping_neg();
-                        suspects += hit as usize;
+                        let seen = x & m;
+                        *b1.get_unchecked_mut(w) = x | m | (seen << 1);
+                        suspects += (seen != 0) as usize;
                     }
                 }
             });
         }
+        let d1 = Instant::now();
+        dtm[0] += (d1 - d0).as_secs_f64();
         if suspects == 0 {
             continue;
         }
@@ -1226,7 +1092,7 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
             th.ss.for_slices(bkt, |sl| {
                 for r in sl {
                     let i = (r.ek.wrapping_mul(K2) >> sh) as usize;
-                    let bit = (unsafe { *b2.get_unchecked(i >> 6) } >> (i & 63)) & 1;
+                    let bit = (unsafe { *b1.get_unchecked(i >> 5) } >> (2 * (i & 31) + 1)) & 1;
                     unsafe { sus.as_mut_ptr().add(ns).write((r.ek, r.ingest, r.loc, t as u32)) };
                     ns += bit as usize;
                 }
@@ -1242,6 +1108,8 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
                 }
             }
         }
+        let d2 = Instant::now();
+        dtm[1] += (d2 - d1).as_secs_f64();
         let cap = (ns * 2).next_power_of_two().max(16);
         let tshift = 64 - cap.trailing_zeros();
         let mask = cap - 1;
@@ -1268,6 +1136,10 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
                 j = (j + 1) & mask;
             }
         }
+        dtm[2] += d2.elapsed().as_secs_f64();
+    }
+    if prof() {
+        eprintln!("  dedup thread: first pass {:.1} suspects {:.1} table {:.1} ms", dtm[0] * 1e3, dtm[1] * 1e3, dtm[2] * 1e3);
     }
     killed
 }
@@ -1296,6 +1168,7 @@ struct UdWriter {
     defs: Vec<u8>,
     n: usize,
     total: usize,
+    wt: f64, // seconds spent handing row groups to the file
 }
 
 const GROUP_ROWS: usize = 1 << 16;
@@ -1318,6 +1191,7 @@ impl UdWriter {
             defs: vec![0; GROUP_ROWS / 8 + 8],
             n: 0,
             total: 0,
+            wt: 0.0,
         }
     }
     #[inline(always)]
@@ -1331,6 +1205,9 @@ impl UdWriter {
                 *p.add(12) = ninth;
                 self.uid.set_len(self.uid.len() + 4 + len);
             }
+        } else if person & SLOW_BIT != 0 {
+            // a long ID: its bytes come straight from the input file
+            put_str(&mut self.uid, unsafe { ids::loc_bytes(nloc) });
         } else {
             let mut tmp = Vec::new();
             ids::id_bytes(person, nloc, &mut tmp);
@@ -1361,6 +1238,7 @@ impl UdWriter {
             let f = std::fs::File::create(&self.path).expect("create user_daily part");
             self.w = Some(parquet::Writer::new(f, parquet::USER_DAILY).unwrap());
         }
+        let wt0 = Instant::now();
         self.w
             .as_mut()
             .unwrap()
@@ -1376,6 +1254,7 @@ impl UdWriter {
                 ],
             )
             .unwrap();
+        self.wt += wt0.elapsed().as_secs_f64();
         self.total += n;
         self.n = 0;
         self.uid.clear();
@@ -1438,6 +1317,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
     let mut ck: Vec<CR> = Vec::new();
     let (mut ecount, mut ccount, mut pos) = (Vec::<u32>::new(), Vec::<u32>::new(), Vec::<u32>::new());
     let mut tm = [0f64; 2];
+    let mut tms = [0f64; 4];
     loop {
         let k = next.fetch_add(1, Relaxed);
         if k >= np {
@@ -1458,6 +1338,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
                 }
             });
         }
+        let qa = Instant::now();
         let nsub = (n_all / 8).next_power_of_two().clamp(16, 1 << 16);
         let sbits = nsub.trailing_zeros();
         let pb = ctx.pbits;
@@ -1468,10 +1349,11 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         for t in parsed {
             t.es.for_slices_ahead(p, |sl| {
                 for e in sl {
-                    ecount[sub(e.person) + 1] += (e.pay != DEAD) as u32;
+                    unsafe { *ecount.get_unchecked_mut(sub(e.person) + 1) += (e.pay != DEAD) as u32 };
                 }
             });
         }
+        let qb = Instant::now();
         for i in 0..nsub {
             ecount[i + 1] += ecount[i];
         }
@@ -1497,13 +1379,14 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
             });
         }
         unsafe { ev.set_len(n) };
+        let qc = Instant::now();
         // clicks: same
         ccount.clear();
         ccount.resize(nsub + 1, 0);
         for t in parsed {
             t.cs.for_slices(p, |sl| {
                 for c in sl {
-                    ccount[sub(c.person) + 1] += 1;
+                    unsafe { *ccount.get_unchecked_mut(sub(c.person) + 1) += 1 };
                 }
             });
         }
@@ -1521,24 +1404,32 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
                 for c in sl {
                     let s = sub(c.person);
                     unsafe {
-                        d.add(pos[s] as usize).write(*c);
+                        let slot = pos.get_unchecked_mut(s);
+                        d.add(*slot as usize).write(*c);
+                        *slot += 1;
                     }
-                    pos[s] += 1;
                 }
             });
         }
         unsafe { ck.set_len(nc) };
         let q1 = Instant::now();
+        tms[0] += (qa - q0).as_secs_f64();
+        tms[1] += (qb - qa).as_secs_f64();
+        tms[2] += (qc - qb).as_secs_f64();
+        tms[3] += (q1 - qc).as_secs_f64();
         for s in 0..nsub {
             let mut es = &mut ev[ecount[s] as usize..ecount[s + 1] as usize];
             let cs = &ck[ccount[s] as usize..ccount[s + 1] as usize];
             while !es.is_empty() {
                 let person = es[0].person;
                 let mut m = 1;
-                for i in 1..es.len() {
-                    if es[i].person == person {
-                        es.swap(i, m);
-                        m += 1;
+                unsafe {
+                    let base = es.as_mut_ptr();
+                    for i in 1..es.len() {
+                        if (*base.add(i)).person == person {
+                            std::ptr::swap(base.add(i), base.add(m));
+                            m += 1;
+                        }
                     }
                 }
                 let (mine, rest) = es.split_at_mut(m);
@@ -1549,8 +1440,11 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         tm[0] += (q1 - q0).as_secs_f64();
         tm[1] += q1.elapsed().as_secs_f64();
     }
+    let wt = out.wt;
+    let tfin = Instant::now();
     let total = out.finish();
     if prof() {
+        eprintln!("  sess thread: writes {:.1} ms, finish {:.1} ms | names {:.1} hist {:.1} scatter {:.1} clicks {:.1}", wt * 1e3, tfin.elapsed().as_secs_f64() * 1e3, tms[0] * 1e3, tms[1] * 1e3, tms[2] * 1e3, tms[3] * 1e3);
         eprintln!("  sess thread: scatter {:.1} persons {:.1} ms | Mcycles bins {} sessions {} clicks {} walk {} | persons {} sessions {} clicks {}", tm[0] * 1e3, tm[1] * 1e3, sc.tsc[0] / 1_000_000, sc.tsc[1] / 1_000_000, sc.tsc[2] / 1_000_000, sc.tsc[3] / 1_000_000, sc.tsc[4], sc.tsc[5], sc.tsc[6]);
     }
     let merged: Vec<[i64; 4]> = sc.camp.iter().zip(&sc.asst).map(|(c, &a)| [c[0] & 0xFFFF_FFFF, c[0] >> 32, c[1], a as i64]).collect();
@@ -1559,6 +1453,19 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
 
 #[inline(always)]
 fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, out: &mut UdWriter) {
+    // A hashed person key needs its bytes for the output: seen with an event
+    // of this partition, or else it is a linked ID. They are far away, in the
+    // input file: ask for them now, they are wanted when the first day is written.
+    let nloc = if person & SLOW_BIT != 0 {
+        let l = match sc.nmap.get(person) {
+            Some(l) => l,
+            None => ctx.person.name_loc(person).expect("name of a linked person"),
+        };
+        prefetch_line(unsafe { ids::loc_bytes(l) }.as_ptr());
+        l
+    } else {
+        0
+    };
     #[cfg(feature = "prof")]
     {
         let t0 = tsc();
@@ -1568,7 +1475,7 @@ fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, o
         let t2 = tsc();
         person_clicks(person, cks, sc);
         let t3 = tsc();
-        person_walk(ctx, person, sc, out);
+        person_walk(ctx, person, nloc, sc, out);
         let t4 = tsc();
         sc.tsc[0] += t1 - t0;
         sc.tsc[1] += t2 - t1;
@@ -1584,7 +1491,7 @@ fn do_person(ctx: &Ctx, person: u64, evs: &[ER], cks: &[CR], sc: &mut Scratch, o
         let (lo_w, hi_w) = person_bins(evs, sc);
         person_sessions(ctx, lo_w, hi_w, sc);
         person_clicks(person, cks, sc);
-        person_walk(ctx, person, sc, out);
+        person_walk(ctx, person, nloc, sc, out);
     }
 }
 
@@ -1643,23 +1550,26 @@ fn person_sessions(ctx: &Ctx, lo_w: usize, hi_w: usize, sc: &mut Scratch) {
     let mut di = 0u32;
     let mut dend = ctx.day_end0;
     for w in lo_w..=hi_w {
-        let mut m = sc.bits[w];
-        sc.bits[w] = 0;
+        // every bin whose bit is set was written by `person_bins`: inside the arrays
+        let mut m = unsafe { *sc.bits.get_unchecked(w) };
+        unsafe { *sc.bits.get_unchecked_mut(w) = 0 };
         while m != 0 {
             let b = w * 64 + m.trailing_zeros() as usize;
             m &= m - 1;
-            let mn = sc.bmin[b];
+            let (mn, cnt) = unsafe { (*sc.bmin.get_unchecked(b), *sc.bcnt.get_unchecked(b)) };
             if !sc.sess.is_empty() && b == prev_b + 1 && mn - last <= GAP {
-                sc.sess.last_mut().unwrap().events += sc.bcnt[b];
+                sc.sess.last_mut().unwrap().events += cnt;
             } else {
                 while mn as i64 >= dend {
                     di += 1;
                     dend += DAY;
                 }
-                sc.sess.push(Sess { start: mn, events: sc.bcnt[b], rev: 0, di, purchases: 0 });
+                sc.sess.push(Sess { start: mn, events: cnt, rev: 0, di, purchases: 0 });
             }
-            sc.bsess[b] = (sc.sess.len() - 1) as u32;
-            last = sc.bmax[b];
+            unsafe {
+                *sc.bsess.get_unchecked_mut(b) = (sc.sess.len() - 1) as u32;
+                last = *sc.bmax.get_unchecked(b);
+            }
             prev_b = b;
         }
     }
@@ -1687,9 +1597,12 @@ fn person_clicks(person: u64, cks: &[CR], sc: &mut Scratch) {
     }
 }
 
+#[cfg(feature = "prof")]
+static WALKT: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
+fn person_walk(ctx: &Ctx, person: u64, nloc: u64, sc: &mut Scratch, out: &mut UdWriter) {
     let nd = ctx.nd;
     let cl = &sc.clk;
     let has_clicks = !cl.is_empty();
@@ -1697,29 +1610,29 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
     let nsess = sc.sess.len() as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut cur = sc.sess[0].di;
-    // a hashed person key needs its bytes: seen with an event of this
-    // partition, or else it is a linked ID
-    let nloc = if person & SLOW_BIT != 0 {
-        match sc.nmap.get(person) {
-            Some(l) => l,
-            None => ctx.person.name_loc(person).expect("name of a linked person"),
-        }
-    } else {
-        0
-    };
     let (mut d_sessions, mut d_events, mut d_rev, mut d_pur) = (0u32, 0u32, 0i64, 0u32);
     // A campaign is "active" while one of its clicks is within the 7 days before
     // the current session. `since[c]` is the first session it assisted that is
     // not yet counted; counts are settled when the day changes, when the
     // campaign drops out, and at the end.
+    #[cfg(feature = "prof")]
+    let mut tw = [0u64; 3];
     for ord in 0..nsess {
-        let s = sc.sess[ord as usize];
+        let s = unsafe { *sc.sess.get_unchecked(ord as usize) };
         if s.di != cur {
+            #[cfg(feature = "prof")]
+            let q = tsc();
             flush_day(ctx, person, nloc, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+            #[cfg(feature = "prof")]
+            {
+                tw[0] += tsc() - q;
+            }
             for &c in &sc.active {
                 let c = c as usize;
-                sc.asst[c * nd + cur as usize] += ord - sc.since[c];
-                sc.since[c] = ord;
+                unsafe {
+                    *sc.asst.get_unchecked_mut(c * nd + cur as usize) += ord - *sc.since.get_unchecked(c);
+                    *sc.since.get_unchecked_mut(c) = ord;
+                }
             }
             cur = s.di;
             d_sessions = 0;
@@ -1733,15 +1646,19 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
         d_pur += s.purchases;
         let di = s.di as usize;
         let mut credited = organic;
+        #[cfg(feature = "prof")]
+        let q = tsc();
         if has_clicks {
             while hi < cl.len() && cl[hi].0 <= s.start {
                 let c = cl[hi].1 as usize;
-                if sc.cnt[c] == 0 {
-                    sc.since[c] = ord;
-                    sc.posn[c] = sc.active.len() as u32;
-                    sc.active.push(c as u32);
+                unsafe {
+                    if *sc.cnt.get_unchecked(c) == 0 {
+                        *sc.since.get_unchecked_mut(c) = ord;
+                        *sc.posn.get_unchecked_mut(c) = sc.active.len() as u32;
+                        sc.active.push(c as u32);
+                    }
+                    *sc.cnt.get_unchecked_mut(c) += 1;
                 }
-                sc.cnt[c] += 1;
                 hi += 1;
             }
             let floor = s.start as i64 - WEEK;
@@ -1772,11 +1689,31 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
                 credited = cl[best].1 as usize;
             }
         }
-        let a = &mut sc.camp[credited * nd + di];
+        #[cfg(feature = "prof")]
+        let q2 = tsc();
+        let a = unsafe { sc.camp.get_unchecked_mut(credited * nd + di) };
         a[0] += 1 + (((s.purchases > 0) as i64) << 32);
         a[1] += s.rev;
+        #[cfg(feature = "prof")]
+        {
+            tw[1] += q2 - q;
+            tw[2] += tsc() - q2;
+        }
     }
+    #[cfg(feature = "prof")]
+    let q = tsc();
     flush_day(ctx, person, nloc, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+    #[cfg(feature = "prof")]
+    {
+        tw[0] += tsc() - q;
+        sc.tsc[7] += tw[0];
+        if person & SLOW_BIT != 0 {
+            WALKT[2].fetch_add(tw[0], Relaxed);
+        } else {
+            WALKT[0].fetch_add(tw[0], Relaxed);
+        }
+        WALKT[1].fetch_add(tw[1], Relaxed);
+    }
     for i in 0..sc.active.len() {
         let c = sc.active[i] as usize;
         sc.asst[c * nd + cur as usize] += nsess - sc.since[c];
@@ -1894,7 +1831,6 @@ fn tile_ids(buf: &mut [u8], k: usize) {
 /// 60M and 20M events, for several partition counts; then the parse phase on
 /// fresh file mappings against anonymous copies. Returns text rows.
 static DEC_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static PAIR_STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static KILL_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[inline(always)]
@@ -1963,7 +1899,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
     // S: as shipped; N: no request for the lines of dead copies; R: N plus reading blocks ahead; Q: shipped plus reading ahead
-    let runs: [(&str, usize, u32, u32); 9] = [("Sa", small, 0, 0), ("Na", small, 0, 0), ("Ra", small, 0, 0), ("Qa", small, 0, 0), ("Sb", small, 0, 0), ("Nb", small, 0, 0), ("Rb", small, 0, 0), ("Qb", small, 0, 0), ("Sa3", small, 0, 0)];
+    // S: as shipped; T: 32 KB sub-chunks; U: 64 KB
+    let runs: [(&str, usize, u32, u32); 7] = [("Sa", small, 0, 0), ("Ta", small, 0, 0), ("Ua", small, 0, 0), ("Sb", small, 0, 0), ("Tb", small, 0, 0), ("Ub", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1980,8 +1917,14 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
-        std::env::set_var("PAIR", "0");
-        KILL_PF.store(!(label.starts_with('N') || label.starts_with('R')), Relaxed);
+        unsafe {
+            match label.as_bytes()[0] {
+                b'T' => std::env::set_var("SUB", "32768"),
+                b'U' => std::env::set_var("SUB", "65536"),
+                _ => std::env::remove_var("SUB"),
+            }
+        }
+        KILL_PF.store(false, Relaxed);
         buf::READ_AHEAD.store(label.starts_with('R') || label.starts_with('Q'), Relaxed);
         let t = Instant::now();
         let marks: std::sync::Mutex<([(u16, f64); 16], usize)> = std::sync::Mutex::new(([(0, 0.0); 16], 0));
@@ -2025,24 +1968,21 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         make_chunks(&tiled[..small * nev], 0, 0, 1 << 20, &mut ch);
         make_chunks(&tiled[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch);
         let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * small + (64 << 20);
-        let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false, pair: true };
+        let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
         let mut ch_ev = Vec::new();
         make_chunks(&tiled[..small * nev], 0, 0, 1 << 20, &mut ch_ev);
         let mut ch_ck = Vec::new();
         make_chunks(&tiled[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch_ck);
         // the share of the arenas each thread fills, with room to spare
         let share = ((ev_bytes / 85 * 32 + ck_bytes / 60 * 24) * small / nthreads) * 3 / 2 + (32 << 20);
-        // (name, next-line request distance or 0, pairing: 0 off, 1 mixed, 2 strict)
-        let vars: [(&str, usize, u8); 7] = [("no", 0, 0), ("a64", 64, 0), ("a128", 128, 0), ("p1", 64, 1), ("p2", 64, 2), ("a192", 192, 0), ("p2n", 0, 2)];
+        // sub-chunk sizes
+        let vars: [(&str, usize); 6] = [("s16", 16 << 10), ("s32", 32 << 10), ("s64", 64 << 10), ("s128", 128 << 10), ("s8", 8 << 10), ("s256", 256 << 10)];
         for round in 0..2 {
-            for (name, ahead, pairing) in vars {
-                buf::AHEAD.store(ahead > 0, Relaxed);
-                buf::AHEAD_BYTES.store(ahead.max(64), Relaxed);
-                PAIR_STRICT.store(pairing == 2, Relaxed);
+            for (name, sub) in vars {
                 let mut best = f64::MAX;
                 for _ in 0..2 {
                     let t = Instant::now();
-                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { pair: pairing > 0, ..base });
+                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { sub, ..base });
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
                     for p in parsed.iter_mut() {
                         p.arena.free();
@@ -2051,7 +1991,6 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 out.push((format!("{name}{round}"), best));
             }
         }
-        PAIR_STRICT.store(false, Relaxed);
         buf::AHEAD.store(true, Relaxed);
         buf::AHEAD_BYTES.store(64, Relaxed);
         DEC_PF.store(true, Relaxed);

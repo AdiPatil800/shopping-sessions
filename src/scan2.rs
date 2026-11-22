@@ -135,12 +135,18 @@ pub fn index(buf: &[u8], start: usize, end: usize, ix: &mut Index) {
             }
         }};
     }
-    // Whole blocks strictly inside the chunk: no edge handling at all.
-    while p + 64 < end {
-        let (nl, cm, q) = unsafe { masks(base.add(p)) };
-        let nb = unsafe { *base.add(p + 64) };
-        step!(nl, cm, q, (nb == b',' || nb == b'\n') as u64);
-        p += 64;
+    // Whole blocks strictly inside the chunk: no edge handling at all, in a
+    // loop of its own that keeps its few values in registers.
+    if p + 64 < end {
+        let nblocks = (end - p - 1) / 64;
+        let mut st = Carry { prev_s63, close_carry, cin: cin as u64, nsep, nnl };
+        unsafe { whole_blocks(base.add(p), nblocks, (p - start) as u32, sep, nlp, &mut st, &mut ix.bad) };
+        prev_s63 = st.prev_s63;
+        close_carry = st.close_carry;
+        cin = st.cin != 0;
+        nsep = st.nsep;
+        nnl = st.nnl;
+        p += nblocks * 64;
     }
     // The last block or two, with the general loader.
     let mut cur = load(p);
@@ -157,6 +163,96 @@ pub fn index(buf: &[u8], start: usize, end: usize, ix: &mut Index) {
     ix.bad.push(u32::MAX);
     ix.nsep = nsep;
     ix.nnl = nnl;
+}
+
+/// What the scan carries from one block to the next, and where it is writing.
+struct Carry {
+    prev_s63: u64,
+    close_carry: u64,
+    cin: u64,
+    nsep: usize,
+    nnl: usize,
+}
+
+#[cold]
+#[inline(never)]
+fn note_bad(bad: &mut Vec<u32>, rel: u32, mut m: u64) {
+    while m != 0 {
+        bad.push(rel + m.trailing_zeros());
+        m &= m - 1;
+    }
+}
+
+/// `n` whole blocks at `p`, each followed by at least one readable byte; the
+/// first is `rel` bytes into the chunk. Same work as the general step.
+#[inline(never)]
+unsafe fn whole_blocks(mut p: *const u8, n: usize, mut rel: u32, sep: *mut u32, nlp: *mut u32, st: &mut Carry, bad: &mut Vec<u32>) {
+    let (mut prev, mut cc, mut cin) = (st.prev_s63, st.close_carry, st.cin);
+    let (mut so, mut no) = (sep.add(st.nsep), nlp.add(st.nnl));
+    for _ in 0..n {
+        let (nl, cm, q) = masks(p);
+        let nb = *p.add(64);
+        let next_s0 = ((nb == b',') | (nb == b'\n')) as u64;
+        let s = nl | cm;
+        let starts = (s << 1) | prev;
+        let ends = (s >> 1) | (next_s0 << 63);
+        let open = q & starts;
+        let close = q & ends;
+        let (x, c1) = (!s).overflowing_add(open);
+        let (x, c2) = x.overflowing_add(cin);
+        let opened = x & s;
+        let closed = ((close << 1) | cc) & s;
+        let badm = (q & !(open | close)) | (open & close) | (opened ^ closed);
+        cin = (c1 | c2) as u64;
+        cc = close >> 63;
+        prev = s >> 63;
+        if badm != 0 {
+            note_bad(bad, rel, badm);
+        }
+        let cnt = s.count_ones() as usize;
+        let mut m = s;
+        macro_rules! put {
+            ($k:expr) => {
+                *so.add($k) = rel + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            };
+        }
+        put!(0);
+        put!(1);
+        put!(2);
+        put!(3);
+        put!(4);
+        put!(5);
+        put!(6);
+        put!(7);
+        if cnt > 8 {
+            for k in 8..cnt {
+                *so.add(k) = rel + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+        }
+        so = so.add(cnt);
+        let ncnt = nl.count_ones() as usize;
+        let mut m = nl;
+        *no = rel + m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+        *no.add(1) = rel + m.trailing_zeros();
+        if ncnt > 2 {
+            m &= m.wrapping_sub(1);
+            for k in 2..ncnt {
+                *no.add(k) = rel + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+        }
+        no = no.add(ncnt);
+        p = p.add(64);
+        rel += 64;
+    }
+    st.prev_s63 = prev;
+    st.close_carry = cc;
+    st.cin = cin;
+    st.nsep = so.offset_from(sep) as usize;
+    st.nnl = no.offset_from(nlp) as usize;
 }
 
 /// Calls `f(row_start, seps)` for every well-formed row with exactly N fields:
