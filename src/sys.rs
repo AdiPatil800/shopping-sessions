@@ -92,3 +92,20 @@ pub fn anon(len: usize, huge: bool) -> *mut u8 {
 pub fn unmap(addr: *const u8, len: usize) {
     unsafe { munmap(addr as *mut u8, len) };
 }
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+extern "C" {
+    fn clock_gettime(clk: i32, ts: *mut Timespec) -> i32;
+}
+
+/// CPU time used by the calling thread, in milliseconds.
+pub fn thread_cpu_ms() -> f64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let clk = if cfg!(target_os = "linux") { 3 } else { 16 };
+    unsafe { clock_gettime(clk, &mut ts) };
+    ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 * 1e-6
+}

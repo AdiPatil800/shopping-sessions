@@ -18,6 +18,7 @@ mod ids;
 mod links;
 mod parquet;
 mod scan;
+mod scan2;
 mod sys;
 mod ts;
 
@@ -355,6 +356,30 @@ fn log(t0: &Instant, what: &str) {
     eprintln!("[{:8.3} ms] {what}", t0.elapsed().as_secs_f64() * 1e3);
 }
 
+/// Bounds of field `i` of a row (quotes stripped). `rs` is the row start and
+/// `q` its separators, both relative to `start`.
+macro_rules! field {
+    ($p:expr, $start:expr, $rs:expr, $q:expr, $i:expr) => {{
+        let s = if $i == 0 { $start + $rs as usize } else { $start + $q[$i - 1] as usize + 1 };
+        let e = $start + $q[$i] as usize;
+        let qf = unsafe { *$p.add(s) == b'"' } as usize;
+        (s + qf, e - qf)
+    }};
+}
+
+/// Same for the last field, which may end at the very end of the buffer.
+macro_rules! last_field {
+    ($b:expr, $start:expr, $q:expr, $i:expr) => {{
+        let s = $start + $q[$i - 1] as usize + 1;
+        let e = $start + $q[$i] as usize;
+        if s < e && $b[s] == b'"' {
+            (s + 1, e - 1)
+        } else {
+            (s, e)
+        }
+    }};
+}
+
 fn load_lookups(data: &Path) -> Lookups {
     // products: (key, temporary category id), then ids become ranks by name
     let bytes = std::fs::read(data.join("products.csv")).unwrap_or_default();
@@ -476,19 +501,20 @@ fn main() {
     let next = AtomicUsize::new(0);
     let pairs: Vec<Vec<(u64, u64)>> = run_threads(nthreads, |_| {
         let mut v = Vec::new();
-        let mut f = [(0usize, 0usize); 2];
+        let mut ix = scan2::Index::new();
         loop {
             let k = next.fetch_add(1, Relaxed);
             let Some(c) = lchunks.get(k) else { break };
             let b = maps[c.file as usize].bytes();
-            scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
-                if nc != 1 || !scan::fields::<2>(b, ls, le, commas, qc, &mut f) {
+            let (start, p) = (c.start, b.as_ptr());
+            scan2::index(b, start, c.end, &mut ix);
+            scan2::rows::<2>(&ix, |rs, q| {
+                let (s0, e0) = field!(p, start, rs, q, 0);
+                let (s1, e1) = last_field!(b, start, q, 1);
+                if s0 == e0 || s1 == e1 {
                     return;
                 }
-                if f[0].0 == f[0].1 || f[1].0 == f[1].1 {
-                    return;
-                }
-                v.push((key_at(b, f[0].0, f[0].1), key_at(b, f[1].0, f[1].1)));
+                v.push((key_at(b, s0, e0), key_at(b, s1, e1)));
             });
         }
         v
@@ -525,11 +551,11 @@ fn main() {
     let mut chunks = Vec::new();
     make_chunks(&maps[..nev], 0, 0, 1 << 20, &mut chunks);
     make_chunks(&maps[nev..nev + nck], nev, 1, 1 << 20, &mut chunks);
+    let arena_cap = ev_bytes / 36 * 32 + ck_bytes / 20 * 24 + (2 * np + nb) * BLOCK * 24 + (16 << 20);
     if std::env::var("BENCH").is_ok() {
-        bench(&ctx, &maps, &chunks, nthreads);
+        bench(&ctx, &maps, &chunks, nthreads, arena_cap);
         sys::exit_now(0);
     }
-    let arena_cap = ev_bytes / 36 * 32 + ck_bytes / 20 * 24 + (2 * np + nb) * BLOCK * 24 + (16 << 20);
     let next = AtomicUsize::new(0);
     let unmap_inputs = std::env::var("UNMAP_INPUTS").is_ok();
     let parsed: Vec<Parsed> = run_threads(nthreads, |_| {
@@ -539,26 +565,39 @@ fn main() {
         let mut cs: Streams<CR> = Streams::new(np, BLOCK);
         let mut lr: Vec<LR> = Vec::with_capacity(1 << 15);
         let mut lc: Vec<LC> = Vec::with_capacity(1 << 15);
+        let mut ix = scan2::Index::new();
+        let mut dc = ts::DateCache::new();
+        let timing = prof();
         let mut tm = [0f64; 4];
         loop {
             let k = next.fetch_add(1, Relaxed);
             let Some(c) = chunks.get(k) else { break };
             let b = maps[c.file as usize].bytes();
-            let q0 = Instant::now();
-            if c.kind == 0 {
-                lr.clear();
-                parse_events(&ctx, b, c.start, c.end, &mut lr);
-                let q1 = Instant::now();
-                emit_events(&ctx, &lr, &mut es, &mut ss, &mut arena);
-                tm[0] += (q1 - q0).as_secs_f64();
-                tm[1] += q1.elapsed().as_secs_f64();
-            } else {
-                lc.clear();
-                parse_clicks(&ctx, b, c.start, c.end, &mut lc);
-                let q1 = Instant::now();
-                emit_clicks(&ctx, &lc, &mut cs, &mut arena);
-                tm[2] += (q1 - q0).as_secs_f64();
-                tm[3] += q1.elapsed().as_secs_f64();
+            let events = c.kind == 0;
+            let mut pos = c.start;
+            while pos < c.end {
+                let sub_end = sub_chunk(b, pos, c.end);
+                let q0 = if timing { Some(Instant::now()) } else { None };
+                if events {
+                    lr.clear();
+                    parse_events(&ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lr);
+                    let q1 = if timing { Some(Instant::now()) } else { None };
+                    emit_events(&ctx, &lr, &mut es, &mut ss, &mut arena);
+                    if timing {
+                        tm[0] += (q1.unwrap() - q0.unwrap()).as_secs_f64();
+                        tm[1] += q1.unwrap().elapsed().as_secs_f64();
+                    }
+                } else {
+                    lc.clear();
+                    parse_clicks(&ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lc);
+                    let q1 = if timing { Some(Instant::now()) } else { None };
+                    emit_clicks(&ctx, &lc, &mut cs, &mut arena);
+                    if timing {
+                        tm[2] += (q1.unwrap() - q0.unwrap()).as_secs_f64();
+                        tm[3] += q1.unwrap().elapsed().as_secs_f64();
+                    }
+                }
+                pos = sub_end;
             }
             // Give the pages back now, in parallel, rather than all at exit. One
             // page is kept at each end: neighbours read a few bytes across.
@@ -631,35 +670,59 @@ fn main() {
     sys::exit_now(0);
 }
 
+/// The end of a cache-sized piece of `b[start..end]` that ends on a line end.
 #[inline(always)]
-fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, lr: &mut Vec<LR>) {
-    let mut f = [(0usize, 0usize); 7];
-    let mut dc = ts::DateCache::new();
-    scan::scan_lines(b, start, end, |ls, le, commas, nc, qc| {
-        if nc != 6 || !scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-            return;
-        }
-        let (s0, e0) = f[0];
+fn sub_chunk(b: &[u8], start: usize, end: usize) -> usize {
+    let w = sub_bytes();
+    if end - start <= w {
+        return end;
+    }
+    let mut e = start + w;
+    while e > start && b[e - 1] != b'\n' {
+        e -= 1;
+    }
+    if e == start {
+        e = (find_nl(&b[..end], start + w) + 1).min(end);
+    }
+    e
+}
+
+fn sub_bytes() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("SUB").ok().and_then(|s| s.parse().ok()).unwrap_or(16 << 10))
+}
+
+#[inline(always)]
+fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lr: &mut Vec<LR>) {
+    let p = b.as_ptr();
+    scan2::index(b, start, end, ix);
+    scan2::rows::<7>(ix, |rs, q| {
+        let (s0, e0) = field!(p, start, rs, q, 0);
         if s0 == e0 {
             return;
         }
         let ek = key_at(b, s0, e0);
-        let ingest_ms = ts_at(b, f[3].0, f[3].1, &mut dc);
+        let (s3, e3) = field!(p, start, rs, q, 3);
+        let ingest_ms = ts_at(b, s3, e3, dc);
         let ingest = match ingest_ms {
             Some(ms) => (ms.div_euclid(1000) - ctx.base_s + (1i64 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
             None => u32::MAX,
         };
         let mut e = LR { ek, uk: 0, ingest, ts: 0, pay: 0, valid: 0 };
         'v: {
-            if f[1].0 == f[1].1 || f[5].0 == f[5].1 {
+            let (s1, e1) = field!(p, start, rs, q, 1);
+            let (s5, e5) = field!(p, start, rs, q, 5);
+            if s1 == e1 || s5 == e5 {
                 break 'v;
             }
-            let Some(t) = ts_at(b, f[2].0, f[2].1, &mut dc) else { break 'v };
+            let (s2, e2) = field!(p, start, rs, q, 2);
+            let Some(t) = ts_at(b, s2, e2, dc) else { break 'v };
             let rel = t - ctx.base;
             if rel < ctx.ws_rel as i64 || rel >= ctx.we_rel as i64 {
                 break 'v;
             }
-            let kind = event_kind(b, f[4].0, f[4].1);
+            let (s4, e4) = field!(p, start, rs, q, 4);
+            let kind = event_kind(b, s4, e4);
             if kind == 0 {
                 break 'v;
             }
@@ -668,13 +731,14 @@ fn parse_events(ctx: &Ctx, b: &[u8], start: usize, end: usize, lr: &mut Vec<LR>)
                 _ => break 'v,
             }
             if kind == 3 {
-                let Some(p) = parse_price(&b[f[6].0..f[6].1]) else { break 'v };
-                let pk = key_at(b, f[5].0, f[5].1);
+                let (s6, e6) = last_field!(b, start, q, 6);
+                let Some(pr) = parse_price(&b[s6..e6]) else { break 'v };
+                let pk = key_at(b, s5, e5);
                 let cat = ctx.lk.prod.get(pk).map(|c| c as u32).unwrap_or(ctx.lk.unknown_cat);
-                e.pay = p | (cat << 24);
+                e.pay = pr | (cat << 24);
             }
             e.ts = rel as u32;
-            e.uk = key_at(b, f[1].0, f[1].1);
+            e.uk = key_at(b, s1, e1);
             e.valid = 1;
         }
         lr.push(e);
@@ -688,9 +752,7 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
     let base = arena.base() as usize;
     for (i, e) in lr.iter().enumerate() {
         if let Some(x) = lr.get(i + PF) {
-            if x.valid != 0 {
-                ctx.person.prefetch(x.uk);
-            }
+            ctx.person.prefetch(x.uk);
         }
         let mut loc = NONE;
         if e.valid != 0 {
@@ -703,23 +765,24 @@ fn emit_events(ctx: &Ctx, lr: &[LR], es: &mut Streams<ER>, ss: &mut Streams<SR>,
 }
 
 #[inline(always)]
-fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, lc: &mut Vec<LC>) {
-    let mut f = [(0usize, 0usize); 4];
-    let mut dc = ts::DateCache::new();
-    scan::scan_lines(b, start, end, |ls, le, commas, nc, qc| {
-        if nc != 3 || !scan::fields::<4>(b, ls, le, commas, qc, &mut f) {
+fn parse_clicks(ctx: &Ctx, b: &[u8], start: usize, end: usize, ix: &mut scan2::Index, dc: &mut ts::DateCache, lc: &mut Vec<LC>) {
+    let p = b.as_ptr();
+    scan2::index(b, start, end, ix);
+    scan2::rows::<4>(ix, |rs, q| {
+        let (s0, e0) = field!(p, start, rs, q, 0);
+        let (s1, e1) = field!(p, start, rs, q, 1);
+        let (s2, e2) = field!(p, start, rs, q, 2);
+        if s0 == e0 || s1 == e1 || s2 == e2 {
             return;
         }
-        if f[0].0 == f[0].1 || f[1].0 == f[1].1 || f[2].0 == f[2].1 {
-            return;
-        }
-        let Some(t) = ts_at(b, f[3].0, f[3].1, &mut dc) else { return };
+        let (s3, e3) = last_field!(b, start, q, 3);
+        let Some(t) = ts_at(b, s3, e3, dc) else { return };
         let rel = t - ctx.base;
         if rel < 0 || rel >= ctx.we_rel as i64 {
             return;
         }
-        let Some(camp) = ctx.lk.camp.get(key_at(b, f[2].0, f[2].1)) else { return };
-        lc.push(LC { uk: key_at(b, f[1].0, f[1].1), ck: key_at(b, f[0].0, f[0].1), ts: rel as u32, camp: camp as u32 });
+        let Some(camp) = ctx.lk.camp.get(key_at(b, s2, e2)) else { return };
+        lc.push(LC { uk: key_at(b, s1, e1), ck: key_at(b, s0, e0), ts: rel as u32, camp: camp as u32 });
     });
 }
 
@@ -1371,15 +1434,21 @@ fn write_campaign_daily(path: &Path, ids: &[Vec<u8>], channels: &[Vec<u8>], tot:
     w.finish().unwrap();
 }
 
-fn bench(ctx: &Ctx, maps: &[sys::Mapped], chunks: &[Chunk], nthreads: usize) {
-    for variant in 0..7 {
+fn bench(ctx: &Ctx, maps: &[sys::Mapped], chunks: &[Chunk], nthreads: usize, arena_cap: usize) {
+    let (np, nb) = (1usize << ctx.pbits, 1usize << ctx.bbits);
+    for variant in 0..5 {
         let t = Instant::now();
         let next = AtomicUsize::new(0);
+        let cpu = std::sync::Mutex::new(0f64);
         let sums: Vec<u64> = run_threads(nthreads, |_| {
+            let c0 = sys::thread_cpu_ms();
             let mut acc = 0u64;
             let mut lr: Vec<LR> = Vec::with_capacity(1 << 15);
-            let mut f = [(0usize, 0usize); 7];
+            let mut ix = scan2::Index::new();
             let mut dc = ts::DateCache::new();
+            let mut arena = Arena::new(if variant == 4 { arena_cap } else { 4096 });
+            let mut es: Streams<ER> = Streams::new(np, BLOCK);
+            let mut ss: Streams<SR> = Streams::new(nb, BLOCK);
             loop {
                 let k = next.fetch_add(1, Relaxed);
                 let Some(c) = chunks.get(k) else { break };
@@ -1395,37 +1464,37 @@ fn bench(ctx: &Ctx, maps: &[sys::Mapped], chunks: &[Chunk], nthreads: usize) {
                             i += 4096;
                         }
                     }
-                    1 => scan::scan_lines(b, c.start, c.end, |ls, _le, _c, nc, qc| acc += (ls + nc) as u64 + qc as u64),
-                    2 => scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
-                        if nc == 6 && scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-                            acc += f[3].0 as u64;
-                        }
-                    }),
-                    3 => scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
-                        if nc == 6 && scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-                            acc += key_at(b, f[0].0, f[0].1) ^ key_at(b, f[1].0, f[1].1);
-                        }
-                    }),
-                    4 => scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
-                        if nc == 6 && scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-                            acc += ts_at(b, f[2].0, f[2].1, &mut dc).unwrap_or(0) as u64;
-                            acc += ts_at(b, f[3].0, f[3].1, &mut dc).unwrap_or(0) as u64;
-                        }
-                    }),
-                    5 => scan::scan_lines(b, c.start, c.end, |ls, le, commas, nc, qc| {
-                        if nc == 6 && scan::fields::<7>(b, ls, le, commas, qc, &mut f) {
-                            acc += ts_at(b, f[3].0, f[3].1, &mut dc).unwrap_or(0) as u64;
-                        }
-                    }),
+                    1 => {
+                        scan2::index(b, c.start, c.end, &mut ix);
+                        acc += ix.sep[0] as u64;
+                    }
+                    2 => {
+                        scan2::index(b, c.start, c.end, &mut ix);
+                        scan2::rows::<7>(&ix, |rs, q| acc += (rs + q[3]) as u64);
+                    }
                     _ => {
                         lr.clear();
-                        parse_events(ctx, b, c.start, c.end, &mut lr);
-                        acc += lr.len() as u64;
+                        let mut pos = c.start;
+                        while pos < c.end {
+                            let sub_end = sub_chunk(b, pos, c.end);
+                            lr.clear();
+                            parse_events(ctx, b, pos, sub_end, &mut ix, &mut dc, &mut lr);
+                            acc += lr.len() as u64;
+                            if variant == 4 {
+                                emit_events(ctx, &lr, &mut es, &mut ss, &mut arena);
+                            }
+                            pos = sub_end;
+                        }
                     }
                 }
             }
+            *cpu.lock().unwrap() += sys::thread_cpu_ms() - c0;
             acc
         });
-        eprintln!("bench variant {variant}: {:.1} ms (sum {})", t.elapsed().as_secs_f64() * 1e3, sums.iter().sum::<u64>() % 1000);
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let minflt = stat.split(' ').nth(9).unwrap_or("?").to_string();
+        let roll = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let g = |k: &str| roll.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string()).unwrap_or_default();
+        eprintln!("bench variant {variant}: {:.1} ms wall, {:.1} ms cpu (sum {}) minflt={} rss={}kB anonhuge={}kB", t.elapsed().as_secs_f64() * 1e3, *cpu.lock().unwrap(), sums.iter().sum::<u64>() % 1000, minflt, g("Rss:"), g("AnonHugePages:"));
     }
 }

@@ -2,7 +2,7 @@
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+pub unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     let a = _mm256_loadu_si256(p as *const __m256i);
     let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
@@ -15,7 +15,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline(always)]
-unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+pub unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     use std::arch::aarch64::*;
     // movemask emulation: AND with bit weights, then pairwise adds.
     let w: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
@@ -40,7 +40,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), all(target_arch = "aarch64", target_feature = "neon"))))]
 #[inline(always)]
-unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+pub unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     let (mut nl, mut cm, mut qt) = (0u64, 0u64, 0u64);
     for i in 0..64 {
         let c = *p.add(i);
