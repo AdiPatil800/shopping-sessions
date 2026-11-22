@@ -36,8 +36,10 @@ impl PersonTable {
         unsafe {
             std::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, std::arch::x86_64::_MM_HINT_T0);
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = k;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) self.slots.as_ptr().add(self.slot(k)), options(nostack, preserves_flags));
+        }
     }
 
     /// The person name of an ID (the ID itself when it is in no link).

@@ -118,6 +118,30 @@ pub fn fields<const N: usize>(buf: &[u8], ls: usize, le: usize, commas: &[usize;
     if qc == 0 {
         return true;
     }
+    if ls == 0 || le >= buf.len() {
+        return fields_slow(buf, qc, out);
+    }
+    // Branch-free: a field is quoted iff its first byte is a quote; then its
+    // last byte must be one too (and not the same byte), and the line may
+    // hold no other quotes. buf[s] and buf[e - 1] are always readable here.
+    let mut nq = 0usize;
+    let mut bad = 0usize;
+    let p = buf.as_ptr();
+    for f in out.iter_mut() {
+        let (s, e) = *f;
+        let qs = unsafe { *p.add(s) == b'"' } as usize;
+        let qe = unsafe { *p.add(e - 1) == b'"' } as usize;
+        bad |= qs ^ qe;
+        bad |= ((e - s) < 2 * qs) as usize;
+        nq += qs;
+        *f = (s + qs, e - qs);
+    }
+    bad == 0 && qc as usize == 2 * nq
+}
+
+#[cold]
+#[inline(never)]
+fn fields_slow<const N: usize>(buf: &[u8], qc: u32, out: &mut [(usize, usize); N]) -> bool {
     let mut nq = 0u32;
     for f in out.iter_mut() {
         let (s, e) = *f;

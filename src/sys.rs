@@ -87,3 +87,8 @@ pub fn anon(len: usize, huge: bool) -> *mut u8 {
     }
     p
 }
+
+/// Unmaps `[addr, addr + len)`; both must be page-aligned.
+pub fn unmap(addr: *const u8, len: usize) {
+    unsafe { munmap(addr as *mut u8, len) };
+}

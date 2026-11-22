@@ -150,16 +150,16 @@ fn digit_bad(x: u64, positions: u64) -> u64 {
     (t | t7.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 & positions
 }
 
-/// F1 `YYYY-MM-DDTHH:MM:SS` + `Z` (20 bytes at `p`) to seconds; years outside
-/// the table fall back to the general parser.
+/// `YYYY-MM-DDTHH:MM:SS` (20 readable bytes at `p`; byte 19 is not looked at)
+/// to seconds. Years outside the table take the general route.
 #[inline(always)]
-pub unsafe fn f1_secs(p: *const u8) -> Option<i64> {
+pub unsafe fn dt19(p: *const u8) -> Option<i64> {
     let a = (p as *const u64).read_unaligned();
     let b = (p.add(8) as *const u64).read_unaligned();
     let c = (p.add(16) as *const u32).read_unaligned() as u64;
     let sep = ((a & 0xFF00_00FF_0000_0000) ^ ((b'-' as u64) << 56 | (b'-' as u64) << 32))
         | ((b & 0x0000_FF00_00FF_0000) ^ ((b':' as u64) << 40 | (b'T' as u64) << 16))
-        | ((c & 0xFF00_00FF) ^ ((b'Z' as u64) << 24 | b':' as u64));
+        | ((c & 0xFF) ^ (b':' as u64));
     // digits: a bytes 0,1,2,3,5,6; b bytes 0,1,3,4,6,7; c bytes 1,2
     let bad = digit_bad(a, 0x0080_8000_8080_8080) | digit_bad(b, 0x8080_0080_8000_8080) | digit_bad(c, 0x0000_0000_0080_8000);
     if (sep | bad) != 0 {
@@ -189,6 +189,26 @@ pub unsafe fn f1_secs(p: *const u8) -> Option<i64> {
         days_from_civil(year, month, day)
     };
     Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// The `+HH:MM` / `-HH:MM` at bytes 19..25 of an F2 timestamp, in seconds to
+/// add to the local time to get UTC.
+#[inline(always)]
+unsafe fn f2_shift(p: *const u8) -> Option<i64> {
+    let w = (p.add(17) as *const u64).read_unaligned(); // bytes 17..25
+    let sign = (w >> 16) as u8;
+    let colon = (w >> 40) as u8;
+    if digit_bad(w, 0x8080_0080_8000_0000) != 0 || colon != b':' || (sign != b'+' && sign != b'-') {
+        return None;
+    }
+    let d = |k: u32| ((w >> (8 * k)) & 0xF) as i64;
+    let oh = d(3) * 10 + d(4);
+    let om = d(6) * 10 + d(7);
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    let off = (oh * 60 + om) * 60;
+    Some(if sign == b'+' { -off } else { off })
 }
 
 /// Value of `len` (1..=16) ASCII digits ending at `e` (exclusive); `e - 16`
@@ -221,12 +241,17 @@ unsafe fn digits16(e: *const u8, len: usize) -> Option<i64> {
 pub unsafe fn parse_ts_fast(p: *const u8, len: usize) -> Option<i64> {
     if len == 20 {
         if *p.add(19) == b'Z' {
-            return f1_secs(p).map(|s| s * 1000);
+            return dt19(p).map(|s| s * 1000);
         }
         return parse_ts(p, len);
     }
     if len >= 1 && len <= 16 {
         return digits16(p.add(len), len);
+    }
+    if len == 25 {
+        if let Some(shift) = f2_shift(p) {
+            return dt19(p).map(|s| (s + shift) * 1000);
+        }
     }
     parse_ts(p, len)
 }
@@ -240,11 +265,7 @@ mod tests {
         let mut buf = b"xxxxxxxxxxxxxxxx".to_vec();
         buf.extend_from_slice(s);
         buf.extend_from_slice(b",yyyyyyyyyyyyyyyyyyyyyyyy");
-        if s.len() <= 20 {
-            unsafe { parse_ts_fast(buf.as_ptr().add(16), s.len()) }
-        } else {
-            parse_ts_slice(s)
-        }
+        unsafe { parse_ts_fast(buf.as_ptr().add(16), s.len()) }
     }
 
     #[test]
