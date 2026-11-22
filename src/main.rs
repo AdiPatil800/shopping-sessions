@@ -671,6 +671,10 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         pf: envu("PFD").unwrap_or(PF),
         arena_cap,
         nt: envu("NT").is_some(),
+        pair: {
+            PAIR_STRICT.store(envu("PAIR") == Some(2), Relaxed);
+            envu("PAIR").is_some_and(|v| v != 0) // off unless asked: no gain measured yet
+        },
     };
     let parsed: Vec<Parsed> = parse_phase(&ctx, maps, files, &chunks, &pp);
     log("parsed");
@@ -756,12 +760,40 @@ struct PP {
     pf: usize,
     arena_cap: usize,
     nt: bool, // write-combining, non-temporal scatter
+    pair: bool, // hyperthread siblings split decoding and scattering
+}
+
+/// A decoded piece of input waiting to be scattered.
+struct Batch {
+    events: bool,
+    lr: Vec<LR>,
+    lc: Vec<LC>,
+}
+
+/// What the workers on one physical core share: who is decoding, and the
+/// decoded pieces not yet scattered.
+#[repr(align(64))]
+struct CoreQ {
+    busy: std::sync::atomic::AtomicBool,
+    len: AtomicUsize,
+    q: std::sync::Mutex<Vec<Batch>>,
+    pool: std::sync::Mutex<Vec<Batch>>,
 }
 
 fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks: &[Chunk], pp: &PP) -> Vec<Parsed> {
     use std::os::unix::fs::FileExt;
     let next = AtomicUsize::new(0);
     let (np, nb) = (1usize << pp.pbits, 1usize << pp.bbits);
+    // Decoding wants the whole core and scattering mostly waits for memory, so
+    // on a core with two hyperthreads one worker decodes while the other
+    // scatters what it decoded. Nobody is pinned: each worker asks where it is
+    // running before every piece of work.
+    let (topo, ncores) = sys::cpu_cores();
+    let pair = pp.pair && pp.mode == 0 && !pp.pread && ncores > &0 && cfg!(target_os = "linux");
+    let cores: Vec<CoreQ> = (0..if pair { *ncores } else { 0 })
+        .map(|_| CoreQ { busy: std::sync::atomic::AtomicBool::new(false), len: AtomicUsize::new(0), q: std::sync::Mutex::new(Vec::new()), pool: std::sync::Mutex::new(Vec::new()) })
+        .collect();
+    let active = AtomicUsize::new(0);
     run_threads(pp.threads, |_| {
         let mut arena = Arena::new(if pp.mode == 0 || pp.mode >= 4 { pp.arena_cap } else { 4096 }, pp.huge);
         #[cfg(feature = "selfbench")]
@@ -794,7 +826,112 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
         let timing = prof();
         let mut tm = [0f64; 4];
         let mut sink = 0u64;
+        if pair {
+            const LIMIT: usize = 3; // decoded pieces a core lets wait
+            let strict = PAIR_STRICT.load(Relaxed);
+            let pop = |o: &CoreQ| -> Option<Batch> {
+                let b = o.q.lock().unwrap().pop();
+                if b.is_some() {
+                    o.len.fetch_sub(1, Relaxed);
+                }
+                b
+            };
+            let mut cur: Option<(usize, usize)> = None; // my chunk, and how far into it
+            let mut idle = 0u32;
+            loop {
+                let cq = &cores[topo.get(sys::current_cpu()).copied().unwrap_or(0) as usize % cores.len()];
+                let backlog = cq.len.load(Relaxed);
+                if backlog < LIMIT {
+                    // decode as this core's decoder, or because there is nothing to scatter
+                    let got = cq.busy.compare_exchange(false, true, Relaxed, Relaxed).is_ok();
+                    let mut decoded = false;
+                    if got || (backlog == 0 && !strict) {
+                        active.fetch_add(1, Relaxed);
+                        if cur.is_none() {
+                            let k = next.fetch_add(1, Relaxed);
+                            if k < chunks.len() {
+                                cur = Some((k, chunks[k].start));
+                            }
+                        }
+                        if let Some((k, pos)) = cur {
+                            let c = &chunks[k];
+                            let b = maps[c.file as usize].bytes();
+                            let sub_end = sub_chunk(b, pos, c.end, pp.sub);
+                            let mut batch = cq.pool.lock().unwrap().pop().unwrap_or_else(|| Batch { events: true, lr: Vec::with_capacity(1 << 10), lc: Vec::with_capacity(1 << 10) });
+                            batch.events = c.kind == 0;
+                            batch.lr.clear();
+                            batch.lc.clear();
+                            {
+                                // a piece too near either end of its buffer is parsed from a padded copy
+                                let orig = unsafe { b.as_ptr().add(pos) };
+                                let (pb, p0, pe): (&[u8], usize, usize) = if pos >= 64 && sub_end + 64 <= b.len() {
+                                    (b, pos, sub_end)
+                                } else {
+                                    let n = sub_end - pos;
+                                    pad.clear();
+                                    pad.resize(64, b'\n');
+                                    pad.extend_from_slice(&b[pos..sub_end]);
+                                    pad.resize(64 + n + 64, 0);
+                                    (&pad[..64 + n], 64, 64 + n)
+                                };
+                                let adj = orig as isize - unsafe { pb.as_ptr().add(p0) } as isize;
+                                if batch.events {
+                                    parse_events(ctx, pb, p0, pe, adj, &mut ix, &mut dc, &mut batch.lr);
+                                } else {
+                                    parse_clicks(ctx, pb, p0, pe, adj, &mut ix, &mut dc, &mut batch.lc);
+                                }
+                            }
+                            cur = if sub_end < c.end { Some((k, sub_end)) } else { None };
+                            cq.q.lock().unwrap().push(batch);
+                            cq.len.fetch_add(1, Relaxed);
+                            decoded = true;
+                        }
+                        active.fetch_sub(1, Relaxed);
+                    }
+                    if got {
+                        cq.busy.store(false, Relaxed);
+                    }
+                    if decoded {
+                        idle = 0;
+                        continue;
+                    }
+                }
+                // scatter: this core's pieces first, then anyone's
+                let mut batch = if cq.len.load(Relaxed) > 0 { pop(cq) } else { None };
+                if batch.is_none() {
+                    for o in cores.iter() {
+                        if o.len.load(Relaxed) > 0 {
+                            batch = pop(o);
+                            if batch.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(bt) = batch {
+                    if bt.events {
+                        emit_events(ctx, &bt.lr, &mut es, &mut ss, &mut ns, &mut arena, pp);
+                    } else {
+                        emit_clicks(ctx, &bt.lc, &mut cs, &mut arena, pp);
+                    }
+                    cq.pool.lock().unwrap().push(bt);
+                    idle = 0;
+                    continue;
+                }
+                if cur.is_none() && next.load(Relaxed) >= chunks.len() && active.load(Relaxed) == 0 && cores.iter().all(|o| o.len.load(Relaxed) == 0) {
+                    break;
+                }
+                std::hint::spin_loop();
+                idle += 1;
+                if idle > 256 {
+                    std::thread::yield_now();
+                }
+            }
+        }
         loop {
+            if pair {
+                break;
+            }
             let k = next.fetch_add(1, Relaxed);
             let Some(c) = chunks.get(k) else { break };
             let (b, cstart, cend): (&[u8], usize, usize) = if pp.pread && pp.mode != 0 {
@@ -1757,6 +1894,7 @@ fn tile_ids(buf: &mut [u8], k: usize) {
 /// 60M and 20M events, for several partition counts; then the parse phase on
 /// fresh file mappings against anonymous copies. Returns text rows.
 static DEC_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PAIR_STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static KILL_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[inline(always)]
@@ -1842,6 +1980,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
+        std::env::set_var("PAIR", "0");
         KILL_PF.store(!(label.starts_with('N') || label.starts_with('R')), Relaxed);
         buf::READ_AHEAD.store(label.starts_with('R') || label.starts_with('Q'), Relaxed);
         let t = Instant::now();
@@ -1886,24 +2025,24 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         make_chunks(&tiled[..small * nev], 0, 0, 1 << 20, &mut ch);
         make_chunks(&tiled[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch);
         let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * small + (64 << 20);
-        let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
+        let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false, pair: true };
         let mut ch_ev = Vec::new();
         make_chunks(&tiled[..small * nev], 0, 0, 1 << 20, &mut ch_ev);
         let mut ch_ck = Vec::new();
         make_chunks(&tiled[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch_ck);
         // the share of the arenas each thread fills, with room to spare
         let share = ((ev_bytes / 85 * 32 + ck_bytes / 60 * 24) * small / nthreads) * 3 / 2 + (32 << 20);
-        // (name, next-line request distance or 0, scatter lookahead, table request while decoding)
-        let vars: [(&str, usize, usize, bool); 6] = [("no", 0, PF, true), ("a64", 64, PF, true), ("a128", 128, PF, true), ("a64n", 64, 9999, true), ("a64d", 64, PF, false), ("a192", 192, PF, true)];
+        // (name, next-line request distance or 0, pairing: 0 off, 1 mixed, 2 strict)
+        let vars: [(&str, usize, u8); 7] = [("no", 0, 0), ("a64", 64, 0), ("a128", 128, 0), ("p1", 64, 1), ("p2", 64, 2), ("a192", 192, 0), ("p2n", 0, 2)];
         for round in 0..2 {
-            for (name, ahead, pf, decpf) in vars {
+            for (name, ahead, pairing) in vars {
                 buf::AHEAD.store(ahead > 0, Relaxed);
                 buf::AHEAD_BYTES.store(ahead.max(64), Relaxed);
-                DEC_PF.store(decpf, Relaxed);
+                PAIR_STRICT.store(pairing == 2, Relaxed);
                 let mut best = f64::MAX;
                 for _ in 0..2 {
                     let t = Instant::now();
-                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { pf, ..base });
+                    let mut parsed = parse_phase(&tctx, &tiled, files, &ch, &PP { pair: pairing > 0, ..base });
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
                     for p in parsed.iter_mut() {
                         p.arena.free();
@@ -1912,6 +2051,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 out.push((format!("{name}{round}"), best));
             }
         }
+        PAIR_STRICT.store(false, Relaxed);
         buf::AHEAD.store(true, Relaxed);
         buf::AHEAD_BYTES.store(64, Relaxed);
         DEC_PF.store(true, Relaxed);
