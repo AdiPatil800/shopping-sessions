@@ -660,7 +660,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     make_chunks(&maps[nev..nev + nck], nev, 1, csize, &mut chunks);
     let arena_cap = ev_bytes / 36 * 48 + ck_bytes / 20 * 24 + (3 * np + nb) * buf::BB + (16 << 20);
     let pp = PP {
-        sub: envu("SUB").unwrap_or(16 << 10),
+        sub: envu("SUB").unwrap_or(64 << 10), // measured on the scoring machine: 32 to 64 KB is best
         pbits: ctx.pbits,
         bbits: ctx.bbits,
         mode: envu("MODE").unwrap_or(0) as u8,
@@ -1899,8 +1899,8 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
 
     // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
     // S: as shipped; N: no request for the lines of dead copies; R: N plus reading blocks ahead; Q: shipped plus reading ahead
-    // S: as shipped; T: 32 KB sub-chunks; U: 64 KB
-    let runs: [(&str, usize, u32, u32); 7] = [("Sa", small, 0, 0), ("Ta", small, 0, 0), ("Ua", small, 0, 0), ("Sb", small, 0, 0), ("Tb", small, 0, 0), ("Ub", small, 0, 0), ("Sa3", small, 0, 0)];
+    // S: as shipped; V: the links table not touched up front
+    let runs: [(&str, usize, u32, u32); 9] = [("Sa", small, 0, 0), ("Va", small, 0, 0), ("Sb", small, 0, 0), ("Vb", small, 0, 0), ("Sc", small, 0, 0), ("Vc", small, 0, 0), ("Sd", small, 0, 0), ("Vd", small, 0, 0), ("Sa3", small, 0, 0)];
     let mut last: Option<Ctx> = None;
     for (label, reps, pb, bb) in runs {
         let mark = sys::bump_mark();
@@ -1917,13 +1917,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 std::env::remove_var("BBITS");
             }
         }
-        unsafe {
-            match label.as_bytes()[0] {
-                b'T' => std::env::set_var("SUB", "32768"),
-                b'U' => std::env::set_var("SUB", "65536"),
-                _ => std::env::remove_var("SUB"),
-            }
-        }
+        links::TOUCH.store(label.as_bytes()[0] != b'V', Relaxed);
         KILL_PF.store(false, Relaxed);
         buf::READ_AHEAD.store(label.starts_with('R') || label.starts_with('Q'), Relaxed);
         let t = Instant::now();
@@ -1937,6 +1931,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
                 g.1 = n + 1;
             }
         });
+        links::TOUCH.store(true, Relaxed);
         KILL_PF.store(true, Relaxed);
         buf::READ_AHEAD.store(false, Relaxed);
         let keep = label == "Sa3";
@@ -1952,7 +1947,9 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         if !keep {
             sys::bump_reset(mark);
         }
-        out.push((format!("{label}:{:.0}/{:.0}/{:.0}/{:.0}", lo, pa - lo, de - pa, se - de), wr));
+        let (lp, lb) = (at(b'l', b'i'), 0.0);
+        let _ = lb;
+        out.push((format!("{label}:{:.0}/{:.0}/{:.0}/{:.0}", lo, pa - lo, de - pa, se - de), lp));
     }
     unsafe {
         std::env::remove_var("PBITS");
