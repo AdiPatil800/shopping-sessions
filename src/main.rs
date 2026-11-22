@@ -531,7 +531,7 @@ fn main() {
     }
     let arena_cap = ev_bytes / 36 * 32 + ck_bytes / 20 * 24 + (2 * np + nb) * BLOCK * 24 + (16 << 20);
     let next = AtomicUsize::new(0);
-    let unmap_inputs = std::env::var("KEEP_MAPS").is_err();
+    let unmap_inputs = std::env::var("UNMAP_INPUTS").is_ok();
     let parsed: Vec<Parsed> = run_threads(nthreads, |_| {
         let mut arena = Arena::new(arena_cap);
         let mut es: Streams<ER> = Streams::new(np, BLOCK);
