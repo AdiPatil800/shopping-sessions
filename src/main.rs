@@ -637,6 +637,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
         threads: nthreads,
         pf: envu("PFD").unwrap_or(PF),
         arena_cap,
+        nt: envu("NT").is_some(),
     };
     let parsed: Vec<Parsed> = parse_phase(&ctx, maps, files, &chunks, &pp);
     log("parsed");
@@ -718,6 +719,7 @@ struct PP {
     threads: usize,
     pf: usize,
     arena_cap: usize,
+    nt: bool, // write-combining, non-temporal scatter
 }
 
 fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks: &[Chunk], pp: &PP) -> Vec<Parsed> {
@@ -726,9 +728,9 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
     let (np, nb) = (1usize << pp.pbits, 1usize << pp.bbits);
     run_threads(pp.threads, |_| {
         let mut arena = Arena::new(if pp.mode == 0 { pp.arena_cap } else { 4096 }, pp.huge);
-        let mut es: Streams<ER> = Streams::new(np, pp.block);
-        let mut ss: Streams<SR> = Streams::new(nb, pp.block);
-        let mut cs: Streams<CR> = Streams::new(np, pp.block);
+        let mut es: Streams<ER> = Streams::new(np, pp.block, pp.nt);
+        let mut ss: Streams<SR> = Streams::new(nb, pp.block, pp.nt);
+        let mut cs: Streams<CR> = Streams::new(np, pp.block, false);
         let mut lr: Vec<LR> = Vec::with_capacity(1 << 12);
         let mut lc: Vec<LC> = Vec::with_capacity(1 << 12);
         let mut ix = scan2::Index::new();
@@ -814,6 +816,8 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                 pos = next_pos;
             }
         }
+        es.finish();
+        ss.finish();
         std::hint::black_box(sink);
         if timing {
             eprintln!("  parse thread: ev scan {:.1} emit {:.1} | ck scan {:.1} emit {:.1} ms", tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3);
@@ -1699,7 +1703,7 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
     make_chunks(&tiled[..tnev], 0, 0, 1 << 20, &mut c1m);
     make_chunks(&tiled[tnev..tnev + tnck], tnev, 1, 1 << 20, &mut c1m);
     let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
-    let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap };
+    let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
     let half = (nthreads / 2).max(1);
     let mut run = |name: &str, pp: PP| {
         let mut best = f64::MAX;
@@ -1728,6 +1732,10 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
     run("s64k", PP { sub: 64 << 10, ..base });
     run("pf0", PP { pf: usize::MAX / 2, ..base });
     run("blk1k", PP { block: 1024, ..base });
+    run("nt", PP { nt: true, ..base });
+    run("nt4", PP { nt: true, threads: half, ..base });
+    run("ntb12", PP { nt: true, pbits: 12, bbits: 12, ..base });
+    run("ntb8", PP { nt: true, pbits: 8, bbits: 8, ..base });
 
     // 3. fresh mappings of the real inputs: first-touch and page-drop cost
     {
