@@ -23,10 +23,12 @@ pub struct PersonTable {
 }
 
 impl PersonTable {
-    /// A table for at most `max_keys` keys: two slots in three taken at the
-    /// very worst, fewer in practice (an ID is usually in several links).
+    /// A table for at most `max_keys` keys, with five slots for every two of
+    /// them (and an ID is usually in several links, so there are fewer keys
+    /// than that). Roomy on purpose: a lookup that finds its bucket full has
+    /// to go on to the next one, a miss nobody asked for in advance.
     fn new(max_keys: usize) -> Self {
-        let nb = (max_keys * 3 / 2 / 4 + 1).max(256);
+        let nb = (max_keys * 5 / 2 / 4 + 1).max(256);
         let cap = nb * 4;
         let slots = unsafe { std::slice::from_raw_parts(sys::anon(cap * 16, true) as *const [AtomicU64; 2], cap) };
         let strs = unsafe { std::slice::from_raw_parts(sys::anon(cap * 8, true) as *const AtomicU64, cap) };

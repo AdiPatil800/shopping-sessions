@@ -1310,6 +1310,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
     let mut ck: Vec<CR> = Vec::new();
     let (mut ecount, mut ccount, mut pos) = (Vec::<u32>::new(), Vec::<u32>::new(), Vec::<u32>::new());
     let mut tm = [0f64; 2];
+    let mut tms = [0f64; 4];
     loop {
         let k = next.fetch_add(1, Relaxed);
         if k >= np {
@@ -1330,6 +1331,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
                 }
             });
         }
+        let qa = Instant::now();
         let nsub = (n_all / 8).next_power_of_two().clamp(16, 1 << 16);
         let sbits = nsub.trailing_zeros();
         let pb = ctx.pbits;
@@ -1344,6 +1346,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
                 }
             });
         }
+        let qb = Instant::now();
         for i in 0..nsub {
             ecount[i + 1] += ecount[i];
         }
@@ -1369,6 +1372,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
             });
         }
         unsafe { ev.set_len(n) };
+        let qc = Instant::now();
         // clicks: same
         ccount.clear();
         ccount.resize(nsub + 1, 0);
@@ -1401,6 +1405,10 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         }
         unsafe { ck.set_len(nc) };
         let q1 = Instant::now();
+        tms[0] += (qa - q0).as_secs_f64();
+        tms[1] += (qb - qa).as_secs_f64();
+        tms[2] += (qc - qb).as_secs_f64();
+        tms[3] += (q1 - qc).as_secs_f64();
         for s in 0..nsub {
             let mut es = &mut ev[ecount[s] as usize..ecount[s + 1] as usize];
             let cs = &ck[ccount[s] as usize..ccount[s + 1] as usize];
@@ -1425,7 +1433,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
     let tfin = Instant::now();
     let total = out.finish();
     if prof() {
-        eprintln!("  sess thread: writes {:.1} ms, finish {:.1} ms", wt * 1e3, tfin.elapsed().as_secs_f64() * 1e3);
+        eprintln!("  sess thread: writes {:.1} ms, finish {:.1} ms | names {:.1} hist {:.1} scatter {:.1} clicks {:.1}", wt * 1e3, tfin.elapsed().as_secs_f64() * 1e3, tms[0] * 1e3, tms[1] * 1e3, tms[2] * 1e3, tms[3] * 1e3);
         eprintln!("  sess thread: scatter {:.1} persons {:.1} ms | Mcycles bins {} sessions {} clicks {} walk {} | persons {} sessions {} clicks {}", tm[0] * 1e3, tm[1] * 1e3, sc.tsc[0] / 1_000_000, sc.tsc[1] / 1_000_000, sc.tsc[2] / 1_000_000, sc.tsc[3] / 1_000_000, sc.tsc[4], sc.tsc[5], sc.tsc[6]);
     }
     let merged: Vec<[i64; 4]> = sc.camp.iter().zip(&sc.asst).map(|(c, &a)| [c[0] & 0xFFFF_FFFF, c[0] >> 32, c[1], a as i64]).collect();
