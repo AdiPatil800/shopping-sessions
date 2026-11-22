@@ -1350,7 +1350,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         for t in parsed {
             t.es.for_slices_ahead(p, |sl| {
                 for e in sl {
-                    ecount[sub(e.person) + 1] += (e.pay != DEAD) as u32;
+                    unsafe { *ecount.get_unchecked_mut(sub(e.person) + 1) += (e.pay != DEAD) as u32 };
                 }
             });
         }
@@ -1387,7 +1387,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         for t in parsed {
             t.cs.for_slices(p, |sl| {
                 for c in sl {
-                    ccount[sub(c.person) + 1] += 1;
+                    unsafe { *ccount.get_unchecked_mut(sub(c.person) + 1) += 1 };
                 }
             });
         }
@@ -1405,9 +1405,10 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
                 for c in sl {
                     let s = sub(c.person);
                     unsafe {
-                        d.add(pos[s] as usize).write(*c);
+                        let slot = pos.get_unchecked_mut(s);
+                        d.add(*slot as usize).write(*c);
+                        *slot += 1;
                     }
-                    pos[s] += 1;
                 }
             });
         }
@@ -1423,10 +1424,13 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
             while !es.is_empty() {
                 let person = es[0].person;
                 let mut m = 1;
-                for i in 1..es.len() {
-                    if es[i].person == person {
-                        es.swap(i, m);
-                        m += 1;
+                unsafe {
+                    let base = es.as_mut_ptr();
+                    for i in 1..es.len() {
+                        if (*base.add(i)).person == person {
+                            std::ptr::swap(base.add(i), base.add(m));
+                            m += 1;
+                        }
                     }
                 }
                 let (mine, rest) = es.split_at_mut(m);
@@ -1547,23 +1551,26 @@ fn person_sessions(ctx: &Ctx, lo_w: usize, hi_w: usize, sc: &mut Scratch) {
     let mut di = 0u32;
     let mut dend = ctx.day_end0;
     for w in lo_w..=hi_w {
-        let mut m = sc.bits[w];
-        sc.bits[w] = 0;
+        // every bin whose bit is set was written by `person_bins`: inside the arrays
+        let mut m = unsafe { *sc.bits.get_unchecked(w) };
+        unsafe { *sc.bits.get_unchecked_mut(w) = 0 };
         while m != 0 {
             let b = w * 64 + m.trailing_zeros() as usize;
             m &= m - 1;
-            let mn = sc.bmin[b];
+            let (mn, cnt) = unsafe { (*sc.bmin.get_unchecked(b), *sc.bcnt.get_unchecked(b)) };
             if !sc.sess.is_empty() && b == prev_b + 1 && mn - last <= GAP {
-                sc.sess.last_mut().unwrap().events += sc.bcnt[b];
+                sc.sess.last_mut().unwrap().events += cnt;
             } else {
                 while mn as i64 >= dend {
                     di += 1;
                     dend += DAY;
                 }
-                sc.sess.push(Sess { start: mn, events: sc.bcnt[b], rev: 0, di, purchases: 0 });
+                sc.sess.push(Sess { start: mn, events: cnt, rev: 0, di, purchases: 0 });
             }
-            sc.bsess[b] = (sc.sess.len() - 1) as u32;
-            last = sc.bmax[b];
+            unsafe {
+                *sc.bsess.get_unchecked_mut(b) = (sc.sess.len() - 1) as u32;
+                last = *sc.bmax.get_unchecked(b);
+            }
             prev_b = b;
         }
     }
@@ -1612,7 +1619,7 @@ fn person_walk(ctx: &Ctx, person: u64, nloc: u64, sc: &mut Scratch, out: &mut Ud
     #[cfg(feature = "prof")]
     let mut tw = [0u64; 3];
     for ord in 0..nsess {
-        let s = sc.sess[ord as usize];
+        let s = unsafe { *sc.sess.get_unchecked(ord as usize) };
         if s.di != cur {
             #[cfg(feature = "prof")]
             let q = tsc();
@@ -1623,8 +1630,10 @@ fn person_walk(ctx: &Ctx, person: u64, nloc: u64, sc: &mut Scratch, out: &mut Ud
             }
             for &c in &sc.active {
                 let c = c as usize;
-                sc.asst[c * nd + cur as usize] += ord - sc.since[c];
-                sc.since[c] = ord;
+                unsafe {
+                    *sc.asst.get_unchecked_mut(c * nd + cur as usize) += ord - *sc.since.get_unchecked(c);
+                    *sc.since.get_unchecked_mut(c) = ord;
+                }
             }
             cur = s.di;
             d_sessions = 0;
@@ -1643,12 +1652,14 @@ fn person_walk(ctx: &Ctx, person: u64, nloc: u64, sc: &mut Scratch, out: &mut Ud
         if has_clicks {
             while hi < cl.len() && cl[hi].0 <= s.start {
                 let c = cl[hi].1 as usize;
-                if sc.cnt[c] == 0 {
-                    sc.since[c] = ord;
-                    sc.posn[c] = sc.active.len() as u32;
-                    sc.active.push(c as u32);
+                unsafe {
+                    if *sc.cnt.get_unchecked(c) == 0 {
+                        *sc.since.get_unchecked_mut(c) = ord;
+                        *sc.posn.get_unchecked_mut(c) = sc.active.len() as u32;
+                        sc.active.push(c as u32);
+                    }
+                    *sc.cnt.get_unchecked_mut(c) += 1;
                 }
-                sc.cnt[c] += 1;
                 hi += 1;
             }
             let floor = s.start as i64 - WEEK;
@@ -1681,7 +1692,7 @@ fn person_walk(ctx: &Ctx, person: u64, nloc: u64, sc: &mut Scratch, out: &mut Ud
         }
         #[cfg(feature = "prof")]
         let q2 = tsc();
-        let a = &mut sc.camp[credited * nd + di];
+        let a = unsafe { sc.camp.get_unchecked_mut(credited * nd + di) };
         a[0] += 1 + (((s.purchases > 0) as i64) << 32);
         a[1] += s.rev;
         #[cfg(feature = "prof")]
