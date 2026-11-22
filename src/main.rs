@@ -953,6 +953,7 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
     let mut b1: Vec<u64> = Vec::new();
     let mut b2: Vec<u64> = Vec::new();
     let mut table: Vec<(u64, u32, u32, u32)> = Vec::new();
+    let mut sus: Vec<(u64, u32, u32, u32)> = Vec::new();
     let mut killed = 0usize;
     let kill = |t: u32, loc: u32| {
         if loc != NONE {
@@ -983,12 +984,10 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
                     let (w, m) = (i >> 6, 1u64 << (i & 63));
                     unsafe {
                         let x = *b1.get_unchecked(w);
-                        if x & m != 0 {
-                            *b2.get_unchecked_mut(w) |= m;
-                            suspects += 1;
-                        } else {
-                            *b1.get_unchecked_mut(w) = x | m;
-                        }
+                        let hit = (x & m != 0) as u64;
+                        *b1.get_unchecked_mut(w) = x | m;
+                        *b2.get_unchecked_mut(w) |= m & hit.wrapping_neg();
+                        suspects += hit as usize;
                     }
                 }
             });
@@ -996,39 +995,46 @@ fn dedup_worker(parsed: &[Parsed], nb: usize, next: &AtomicUsize) -> usize {
         if suspects == 0 {
             continue;
         }
-        let cap = (suspects * 4).next_power_of_two().max(16);
-        let tshift = 64 - cap.trailing_zeros();
-        let mask = cap - 1;
-        table.clear();
-        table.resize(cap, (0, 0, 0, 0));
+        // every record whose bit was hit twice, copied out without branching
+        sus.clear();
+        sus.reserve(n + 1);
+        let mut ns = 0usize;
         for (t, th) in parsed.iter().enumerate() {
             th.ss.for_slices(bkt, |sl| {
                 for r in sl {
                     let i = (r.ek.wrapping_mul(K2) >> sh) as usize;
-                    if unsafe { *b2.get_unchecked(i >> 6) } & (1u64 << (i & 63)) == 0 {
-                        continue;
-                    }
-                    let mut j = ((r.ek.wrapping_mul(K2) << mbits) >> tshift) as usize;
-                    loop {
-                        let slot = unsafe { table.get_unchecked_mut(j) };
-                        if slot.0 == 0 {
-                            *slot = (r.ek, r.ingest, r.loc, t as u32);
-                            break;
-                        }
-                        if slot.0 == r.ek {
-                            killed += 1;
-                            if r.ingest < slot.1 {
-                                kill(slot.3, slot.2);
-                                *slot = (r.ek, r.ingest, r.loc, t as u32);
-                            } else {
-                                kill(t as u32, r.loc);
-                            }
-                            break;
-                        }
-                        j = (j + 1) & mask;
-                    }
+                    let bit = (unsafe { *b2.get_unchecked(i >> 6) } >> (i & 63)) & 1;
+                    unsafe { sus.as_mut_ptr().add(ns).write((r.ek, r.ingest, r.loc, t as u32)) };
+                    ns += bit as usize;
                 }
             });
+        }
+        unsafe { sus.set_len(ns) };
+        let cap = (ns * 2).next_power_of_two().max(16);
+        let tshift = 64 - cap.trailing_zeros();
+        let mask = cap - 1;
+        table.clear();
+        table.resize(cap, (0, 0, 0, 0));
+        for &(ek, ingest, loc, t) in sus.iter() {
+            let mut j = ((ek.wrapping_mul(K2) << mbits) >> tshift) as usize;
+            loop {
+                let slot = unsafe { table.get_unchecked_mut(j) };
+                if slot.0 == 0 {
+                    *slot = (ek, ingest, loc, t);
+                    break;
+                }
+                if slot.0 == ek {
+                    killed += 1;
+                    if ingest < slot.1 {
+                        kill(slot.3, slot.2);
+                        *slot = (ek, ingest, loc, t);
+                    } else {
+                        kill(t, loc);
+                    }
+                    break;
+                }
+                j = (j + 1) & mask;
+            }
         }
     }
     killed
@@ -1174,10 +1180,9 @@ struct Scratch {
     pur: Vec<(u32, u32)>,
     clk: Vec<(u32, u32, u64)>,
     cnt: Vec<u32>,
-    since: Vec<(u32, u32)>,
+    since: Vec<u32>,
     posn: Vec<u32>,
     active: Vec<u32>,
-    dso: Vec<u32>,
     dcat: Vec<i64>,
     camp: Vec<[i64; 2]>, // (sessions | purchasing << 32, revenue) per (campaign, day)
     asst: Vec<u32>,      // assisted sessions per (campaign, day)
@@ -1197,10 +1202,9 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         pur: Vec::new(),
         clk: Vec::new(),
         cnt: vec![0; ctx.ncamp],
-        since: vec![(0, 0); ctx.ncamp],
+        since: vec![0; ctx.ncamp],
         posn: vec![0; ctx.ncamp],
         active: Vec::new(),
-        dso: vec![0; ctx.nd + 2],
         dcat: vec![0; ctx.nd * ctx.ncats],
         camp: vec![[0i64; 2]; (ctx.ncamp + 1) * ctx.nd],
         asst: vec![0u32; (ctx.ncamp + 1) * ctx.nd],
@@ -1232,9 +1236,7 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         for t in parsed {
             t.es.for_slices(p, |sl| {
                 for e in sl {
-                    if e.pay != DEAD {
-                        ecount[sub(e.person) + 1] += 1;
-                    }
+                    ecount[sub(e.person) + 1] += (e.pay != DEAD) as u32;
                 }
             });
         }
@@ -1243,19 +1245,21 @@ fn sessionize_worker(ctx: &Ctx, parsed: &[Parsed], next: &AtomicUsize, order: &[
         }
         let n = ecount[nsub] as usize;
         ev.clear();
-        ev.reserve(n);
+        ev.reserve(n + 1);
         pos.clear();
         pos.extend_from_slice(&ecount[..nsub]);
         let d = ev.as_mut_ptr();
         for t in parsed {
             t.es.for_slices(p, |sl| {
                 for e in sl {
-                    if e.pay != DEAD {
-                        let s = sub(e.person);
-                        unsafe {
-                            d.add(pos[s] as usize).write(*e);
-                        }
-                        pos[s] += 1;
+                    // a dead copy is written to the spare slot past the end
+                    let alive = e.pay != DEAD;
+                    let s = sub(e.person);
+                    unsafe {
+                        let slot = pos.get_unchecked_mut(s);
+                        let at = if alive { *slot as usize } else { n };
+                        d.add(at).write(*e);
+                        *slot += alive as u32;
                     }
                 }
             });
@@ -1374,22 +1378,20 @@ fn person_bins(evs: &[ER], sc: &mut Scratch) -> (usize, usize) {
     for e in evs {
         let b = (e.ts / GAP) as usize;
         let (w, m) = (b >> 6, 1u64 << (b & 63));
+        // A bin seen for the first time ignores whatever its slots still hold.
         unsafe {
-            if *sc.bits.get_unchecked(w) & m == 0 {
-                *sc.bits.get_unchecked_mut(w) |= m;
-                *sc.bmin.get_unchecked_mut(b) = e.ts;
-                *sc.bmax.get_unchecked_mut(b) = e.ts;
-                *sc.bcnt.get_unchecked_mut(b) = 1;
-                lo_w = lo_w.min(w);
-                hi_w = hi_w.max(w);
-            } else {
-                let mn = sc.bmin.get_unchecked_mut(b);
-                *mn = (*mn).min(e.ts);
-                let mx = sc.bmax.get_unchecked_mut(b);
-                *mx = (*mx).max(e.ts);
-                *sc.bcnt.get_unchecked_mut(b) += 1;
-            }
+            let word = sc.bits.get_unchecked_mut(w);
+            let fresh = *word & m == 0;
+            *word |= m;
+            let mn = sc.bmin.get_unchecked_mut(b);
+            *mn = if fresh { e.ts } else { (*mn).min(e.ts) };
+            let mx = sc.bmax.get_unchecked_mut(b);
+            *mx = if fresh { e.ts } else { (*mx).max(e.ts) };
+            let c = sc.bcnt.get_unchecked_mut(b);
+            *c = if fresh { 1 } else { *c + 1 };
         }
+        lo_w = lo_w.min(w);
+        hi_w = hi_w.max(w);
         if e.pay != 0 {
             sc.pur.push((e.ts, e.pay));
         }
@@ -1459,22 +1461,24 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
     let nd = ctx.nd;
     let cl = &sc.clk;
     let has_clicks = !cl.is_empty();
-    // 5. walk the sessions
     let organic = ctx.ncamp;
     let nsess = sc.sess.len() as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
-    let mut filled = sc.sess[0].di as usize;
-    if has_clicks {
-        for d in 0..=filled {
-            sc.dso[d] = 0;
-        }
-    }
     let mut cur = sc.sess[0].di;
     let (mut d_sessions, mut d_events, mut d_rev, mut d_pur) = (0u32, 0u32, 0i64, 0u32);
+    // A campaign is "active" while one of its clicks is within the 7 days before
+    // the current session. `since[c]` is the first session it assisted that is
+    // not yet counted; counts are settled when the day changes, when the
+    // campaign drops out, and at the end.
     for ord in 0..nsess {
         let s = sc.sess[ord as usize];
         if s.di != cur {
             flush_day(ctx, person, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
+            for &c in &sc.active {
+                let c = c as usize;
+                sc.asst[c * nd + cur as usize] += ord - sc.since[c];
+                sc.since[c] = ord;
+            }
             cur = s.di;
             d_sessions = 0;
             d_events = 0;
@@ -1488,16 +1492,10 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
         let di = s.di as usize;
         let mut credited = organic;
         if has_clicks {
-            if di > filled {
-                for d in filled + 1..=di {
-                    sc.dso[d] = ord;
-                }
-                filled = di;
-            }
             while hi < cl.len() && cl[hi].0 <= s.start {
                 let c = cl[hi].1 as usize;
                 if sc.cnt[c] == 0 {
-                    sc.since[c] = (ord, di as u32);
+                    sc.since[c] = ord;
                     sc.posn[c] = sc.active.len() as u32;
                     sc.active.push(c as u32);
                 }
@@ -1509,7 +1507,7 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
                 let c = cl[lo].1 as usize;
                 sc.cnt[c] -= 1;
                 if sc.cnt[c] == 0 {
-                    assist(&mut sc.asst, &sc.dso, c, sc.since[c], ord, filled, nd);
+                    sc.asst[c * nd + di] += ord - sc.since[c];
                     let at = sc.posn[c] as usize;
                     let lastc = sc.active.pop().unwrap();
                     if lastc as usize != c {
@@ -1537,27 +1535,12 @@ fn person_walk(ctx: &Ctx, person: u64, sc: &mut Scratch, out: &mut UdWriter) {
         a[1] += s.rev;
     }
     flush_day(ctx, person, cur, d_sessions, d_events, d_rev, d_pur, &mut sc.dcat, out);
-    if has_clicks {
-        for i in 0..sc.active.len() {
-            let c = sc.active[i] as usize;
-            assist(&mut sc.asst, &sc.dso, c, sc.since[c], nsess, filled, nd);
-            sc.cnt[c] = 0;
-        }
-        sc.active.clear();
+    for i in 0..sc.active.len() {
+        let c = sc.active[i] as usize;
+        sc.asst[c * nd + cur as usize] += nsess - sc.since[c];
+        sc.cnt[c] = 0;
     }
-}
-
-/// Campaign `c` assisted the sessions `a..b` (ordinals); the first is on day `da`.
-#[inline(always)]
-fn assist(asst: &mut [u32], dso: &[u32], c: usize, since: (u32, u32), b: u32, filled: usize, nd: usize) {
-    let (a, da) = since;
-    for d in da as usize..=filled {
-        let l = a.max(dso[d]);
-        let h = if d + 1 > filled { b } else { b.min(dso[d + 1]) };
-        if h > l {
-            asst[c * nd + d] += h - l;
-        }
-    }
+    sc.active.clear();
 }
 
 #[cfg_attr(feature = "prof", inline(never))]

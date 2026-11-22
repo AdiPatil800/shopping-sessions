@@ -75,17 +75,16 @@ pub fn index(buf: &[u8], start: usize, end: usize, ix: &mut Index) {
     };
 
     let mut p = start;
-    let mut cur = load(p);
     let mut prev_s63 = 1u64;
     let mut close_carry = 0u64;
     let mut cin = false;
-    while p < vend {
-        let next = load(p + 64);
-        let (nl, cm, q) = cur;
-        let s = nl | cm;
-        {
+    // One 64-byte block: its masks, and whether the byte after it is a separator.
+    macro_rules! step {
+        ($nl:expr, $cm:expr, $q:expr, $next_s0:expr) => {{
+            let (nl, cm, q): (u64, u64, u64) = ($nl, $cm, $q);
+            let s = nl | cm;
             let starts = (s << 1) | prev_s63;
-            let ends = (s >> 1) | ((next.0 | next.1) << 63);
+            let ends = (s >> 1) | ($next_s0 << 63);
             let open = q & starts;
             let close = q & ends;
             let (x, c1) = (!s).overflowing_add(open);
@@ -102,39 +101,52 @@ pub fn index(buf: &[u8], start: usize, end: usize, ix: &mut Index) {
                     m &= m - 1;
                 }
             }
-        }
-        prev_s63 = s >> 63;
-        let rel = (p - start) as u32;
-        unsafe {
-            let cnt = s.count_ones() as usize;
-            let out = sep.add(nsep);
-            let mut m = s;
-            for k in 0..8 {
-                *out.add(k) = rel + m.trailing_zeros();
-                m &= m.wrapping_sub(1);
-            }
-            if cnt > 8 {
-                for k in 8..cnt {
+            prev_s63 = s >> 63;
+            let rel = (p - start) as u32;
+            unsafe {
+                let cnt = s.count_ones() as usize;
+                let out = sep.add(nsep);
+                let mut m = s;
+                for k in 0..8 {
                     *out.add(k) = rel + m.trailing_zeros();
                     m &= m.wrapping_sub(1);
                 }
-            }
-            nsep += cnt;
-            let ncnt = nl.count_ones() as usize;
-            let out = nlp.add(nnl);
-            let mut m = nl;
-            *out = rel + m.trailing_zeros();
-            m &= m.wrapping_sub(1);
-            *out.add(1) = rel + m.trailing_zeros();
-            if ncnt > 2 {
-                m &= m.wrapping_sub(1);
-                for k in 2..ncnt {
-                    *out.add(k) = rel + m.trailing_zeros();
-                    m &= m.wrapping_sub(1);
+                if cnt > 8 {
+                    for k in 8..cnt {
+                        *out.add(k) = rel + m.trailing_zeros();
+                        m &= m.wrapping_sub(1);
+                    }
                 }
+                nsep += cnt;
+                let ncnt = nl.count_ones() as usize;
+                let out = nlp.add(nnl);
+                let mut m = nl;
+                *out = rel + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+                *out.add(1) = rel + m.trailing_zeros();
+                if ncnt > 2 {
+                    m &= m.wrapping_sub(1);
+                    for k in 2..ncnt {
+                        *out.add(k) = rel + m.trailing_zeros();
+                        m &= m.wrapping_sub(1);
+                    }
+                }
+                nnl += ncnt;
             }
-            nnl += ncnt;
-        }
+        }};
+    }
+    // Whole blocks strictly inside the chunk: no edge handling at all.
+    while p + 64 < end {
+        let (nl, cm, q) = unsafe { masks(base.add(p)) };
+        let nb = unsafe { *base.add(p + 64) };
+        step!(nl, cm, q, (nb == b',' || nb == b'\n') as u64);
+        p += 64;
+    }
+    // The last block or two, with the general loader.
+    let mut cur = load(p);
+    while p < vend {
+        let next = load(p + 64);
+        step!(cur.0, cur.1, cur.2, (next.0 | next.1) & 1);
         cur = next;
         p += 64;
     }
