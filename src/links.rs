@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 const K2: u64 = 0xD6E8_FEB8_6659_FD93;
 
+/// Whether the table is touched up front (a knob in benchmark builds).
+pub static TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub struct PersonTable {
     slots: &'static [[AtomicU64; 2]], // (key, parent while building then person name); key 0 = empty
     strs: &'static [AtomicU64],       // where a hashed key's bytes are (0 for packed keys)
@@ -212,7 +215,9 @@ impl PersonTable {
                     let t = &t;
                     let (next, jobs) = (&next, &jobs);
                     s.spawn(move || {
-                        t.touch(th, n);
+                        if !cfg!(feature = "selfbench") || TOUCH.load(Relaxed) {
+                            t.touch(th, n);
+                        }
                         let mut mine: Vec<u32> = Vec::new();
                         let mut ids: Vec<(u32, u32)> = Vec::with_capacity(JOB);
                         loop {
