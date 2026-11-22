@@ -22,3 +22,4 @@ lto = "fat"
 [features]
 prof = []
 selfbench = []
+profgen = []

@@ -38,6 +38,10 @@ impl Arena {
         self.used += bytes;
         p as *mut u8
     }
+    /// Bytes handed out so far.
+    pub fn used(&self) -> usize {
+        self.used
+    }
     #[inline(always)]
     pub fn base(&self) -> *mut u8 {
         self.base as *mut u8
@@ -140,6 +144,29 @@ impl<T: Copy> Streams<T> {
         match self.blocks[s].last() {
             None => 0,
             Some(&last) => (self.blocks[s].len() - 1) * self.block + (unsafe { self.hot[s].0.offset_from(last) }) as usize,
+        }
+    }
+    /// `for_slices` for a first pass over blocks that are not in the cache:
+    /// asks for the whole next block while working on the current one.
+    #[inline(always)]
+    pub fn for_slices_ahead(&self, s: usize, mut f: impl FnMut(&[T])) {
+        let bl = &self.blocks[s];
+        let n = bl.len();
+        let lines = (self.block * std::mem::size_of::<T>()).div_ceil(64);
+        for (k, &b) in bl.iter().enumerate() {
+            if k + 1 < n {
+                let nx = bl[k + 1] as *const u8;
+                for l in 0..lines {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(nx.add(l * 64) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let _ = (nx, l);
+                }
+            }
+            let len = if k + 1 == n { (unsafe { self.hot[s].0.offset_from(b) }) as usize } else { self.block };
+            f(unsafe { std::slice::from_raw_parts(b, len) });
         }
     }
     /// Calls `f` on each block's filled part of stream `s`.
