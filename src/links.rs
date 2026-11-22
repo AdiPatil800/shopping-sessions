@@ -1,5 +1,5 @@
-//! Linked IDs, in parallel: a concurrent open-addressing table whose slot
-//! index is the node id, and a lock-free union-find over slots. A root is only
+//! Linked IDs, in parallel: a concurrent hash table of 4-slot buckets (one
+//! cache line each) whose slot index is the node id, and a lock-free union-find over slots. A root is only
 //! ever linked under a root with a byte-wise smaller ID, so there are no
 //! cycles and every set's root is its smallest ID: the person's name.
 
@@ -20,14 +20,16 @@ pub struct PersonTable {
 impl PersonTable {
     fn new(expected_keys: usize) -> Self {
         let cap = (expected_keys * 2).next_power_of_two().max(1024);
+        debug_assert!(cap % 4 == 0);
         let slots = unsafe { std::slice::from_raw_parts(sys::anon(cap * 16, true) as *const [AtomicU64; 2], cap) };
         let parent = unsafe { std::slice::from_raw_parts(sys::anon(cap * 4, true) as *const AtomicU32, cap) };
-        PersonTable { slots, parent, shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
+        PersonTable { slots, parent, shift: 64 - (cap / 4).trailing_zeros(), mask: cap - 1 }
     }
 
+    /// First slot of the key's bucket (4 slots, one cache line).
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        (k.wrapping_mul(K2) >> self.shift) as usize
+        ((k.wrapping_mul(K2) >> self.shift) as usize) << 2
     }
 
     #[inline(always)]
@@ -55,20 +57,22 @@ impl PersonTable {
         }
     }
 
-    /// The person name of an ID (the ID itself when it is in no link).
+    /// The person name of an ID (the ID itself when it is in no link). Only
+    /// for use once the table is complete. Slots of a bucket fill in order, so
+    /// an empty last slot means the key is absent; the common cases take no
+    /// data-dependent branch.
     #[inline(always)]
     pub fn person(&self, k: u64) -> u64 {
         let mut i = self.slot(k);
         loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            let x = s[0].load(Relaxed);
-            if x == k {
-                return s[1].load(Relaxed);
+            let b = unsafe { &*(self.slots.as_ptr().add(i) as *const [u64; 8]) };
+            let (m0, m1, m2, m3) = ((b[0] == k) as u64, (b[2] == k) as u64, (b[4] == k) as u64, (b[6] == k) as u64);
+            let v = (b[1] & m0.wrapping_neg()) | (b[3] & m1.wrapping_neg()) | (b[5] & m2.wrapping_neg()) | (b[7] & m3.wrapping_neg());
+            let found = m0 | m1 | m2 | m3;
+            if (found | (b[6] == 0) as u64) != 0 {
+                return v | (k & found.wrapping_sub(1));
             }
-            if x == 0 {
-                return k;
-            }
-            i = (i + 1) & self.mask;
+            i = (i + 4) & self.mask;
         }
     }
 
@@ -77,19 +81,21 @@ impl PersonTable {
     fn insert(&self, k: u64) -> (usize, bool) {
         let mut i = self.slot(k);
         loop {
-            let s = &self.slots[i][0];
-            let x = s.load(Relaxed);
-            if x == k {
-                return (i, false);
-            }
-            if x == 0 {
-                match s.compare_exchange(0, k, Relaxed, Relaxed) {
-                    Ok(_) => return (i, true),
-                    Err(y) if y == k => return (i, false),
-                    Err(_) => {}
+            for j in i..i + 4 {
+                let s = &self.slots[j][0];
+                let x = s.load(Relaxed);
+                if x == k {
+                    return (j, false);
+                }
+                if x == 0 {
+                    match s.compare_exchange(0, k, Relaxed, Relaxed) {
+                        Ok(_) => return (j, true),
+                        Err(y) if y == k => return (j, false),
+                        Err(_) => {}
+                    }
                 }
             }
-            i = (i + 1) & self.mask;
+            i = (i + 4) & self.mask;
         }
     }
 
