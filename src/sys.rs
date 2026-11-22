@@ -225,3 +225,44 @@ pub fn bump_reset(mark: usize) {
     }
     BUMP_NEXT.store(start, Relaxed);
 }
+
+// ---------------------------------------------------------------------------
+// Pinning worker threads: worker `i` of every phase runs on the `i`-th CPU the
+// process may use, so a worker keeps its caches from phase to phase and never
+// shares a core with another worker while a core sits idle.
+
+pub static PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+pub fn pin(i: usize) {
+    extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut u8) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u8) -> i32;
+    }
+    static ALLOWED: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    if !PIN.load(Relaxed) {
+        return;
+    }
+    let cpus = ALLOWED.get_or_init(|| {
+        let mut m = [0u8; 512];
+        let mut v = Vec::new();
+        if unsafe { sched_getaffinity(0, m.len(), m.as_mut_ptr()) } == 0 {
+            for c in 0..m.len() * 8 {
+                if m[c / 8] >> (c % 8) & 1 != 0 {
+                    v.push(c as u16);
+                }
+            }
+        }
+        v
+    });
+    if cpus.is_empty() {
+        return;
+    }
+    let c = cpus[i % cpus.len()] as usize;
+    let mut m = [0u8; 512];
+    m[c / 8] |= 1 << (c % 8);
+    unsafe { sched_setaffinity(0, m.len(), m.as_ptr()) };
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pin(_i: usize) {}
