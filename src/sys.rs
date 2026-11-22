@@ -199,3 +199,21 @@ unsafe impl GlobalAlloc for Bump {
         n
     }
 }
+
+/// Benchmark only: the allocator's high-water mark, and giving back everything
+/// allocated since a mark (nothing allocated since may still be in use).
+#[cfg(feature = "selfbench")]
+pub fn bump_mark() -> usize {
+    BUMP_NEXT.load(Relaxed)
+}
+
+#[cfg(feature = "selfbench")]
+pub fn bump_reset(mark: usize) {
+    let base = BUMP_BASE.load(Relaxed);
+    let start = (mark + 4095) & !4095;
+    let end = (BUMP_NEXT.load(Relaxed) + 4095) & !4095;
+    if end > start {
+        drop_pages((base + start) as *const u8, end - start);
+    }
+    BUMP_NEXT.store(start, Relaxed);
+}

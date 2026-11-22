@@ -717,6 +717,13 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     }
     write_campaign_daily(&out.join("campaign_daily").join("part-000.parquet"), &ctx.lk.camp_ids, &ctx.lk.camp_channels, &camp_tot, day0, nd);
     log(&format!("wrote {total_ud} user_daily rows"));
+    #[cfg(feature = "selfbench")]
+    {
+        let mut parsed = parsed;
+        for p in parsed.iter_mut() {
+            p.arena.free();
+        }
+    }
     ctx
 }
 
@@ -1651,30 +1658,33 @@ static PHASES: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// Makes the IDs of copy `k` of a file distinct: the character after the
 /// leading `e`, `u` or `k` of a field is rotated by `k` in the base-36 alphabet.
 #[cfg(feature = "selfbench")]
-fn tile_ids(buf: &mut [u8], k: u8) {
+fn tile_ids(buf: &mut [u8], k: usize) {
     if k == 0 {
         return;
     }
+    let rot = |c: &mut u8, by: usize| {
+        let v = match *c {
+            b'0'..=b'9' => *c - b'0',
+            b'a'..=b'z' => *c - b'a' + 10,
+            _ => return,
+        };
+        let r = ((v as usize + by) % 36) as u8;
+        *c = if r < 10 { b'0' + r } else { b'a' + r - 10 };
+    };
     let n = buf.len();
     let mut i = match buf.iter().position(|&c| c == b'\n') {
         Some(h) => h + 1,
         None => return,
     };
     let mut at_start = true;
-    while i + 2 < n {
+    while i + 3 < n {
         let c = buf[i];
         if at_start {
             let j = if c == b'"' { i + 1 } else { i };
             if matches!(buf[j], b'e' | b'u' | b'k') {
-                let d = buf[j + 1];
-                let v = match d {
-                    b'0'..=b'9' => Some(d - b'0'),
-                    b'a'..=b'z' => Some(d - b'a' + 10),
-                    _ => None,
-                };
-                if let Some(v) = v {
-                    let r = (v + k) % 36;
-                    buf[j + 1] = if r < 10 { b'0' + r } else { b'a' + r - 10 };
+                rot(&mut buf[j + 1], k % 36);
+                if k >= 36 {
+                    rot(&mut buf[j + 2], k / 36);
                 }
             }
         }
@@ -1683,121 +1693,133 @@ fn tile_ids(buf: &mut [u8], k: u8) {
     }
 }
 
-/// Times the whole pipeline, and variants of the parse phase, on the inputs
-/// tiled several times with distinct IDs. Returns text rows.
+/// Times the whole pipeline on the inputs tiled with distinct IDs, at about
+/// 60M and 20M events, for several partition counts; then the parse phase on
+/// fresh file mappings against anonymous copies. Returns text rows.
 #[cfg(feature = "selfbench")]
 #[allow(clippy::too_many_arguments)]
 fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usize, nthreads: usize, ws: i64, we: i64, data: &Path, out_dir: &Path) -> Vec<String> {
     let ev_bytes: usize = maps[..nev].iter().map(|m| m.len).sum();
     let ck_bytes: usize = maps[nev..nev + nck].iter().map(|m| m.len).sum();
-    let reps = ((1usize << 30) / ev_bytes.max(1)).clamp(1, 64);
-    let mut out: Vec<(String, f64)> = Vec::new();
+    let nln = maps.len() - nev - nck;
+    let gb: usize = std::env::var("BENCH_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let big = ((gb << 30) / ev_bytes.max(1)).clamp(3, 64);
+    let small = (big / 3).max(1);
+    let mut out: Vec<(String, f64)> = Vec::with_capacity(256);
 
-    // 1. the whole pipeline on a tiled copy held in anonymous memory
-    let mut tiled: Vec<sys::Mapped> = Vec::new();
-    for (lo, hi) in [(0, nev), (nev, nev + nck), (nev + nck, maps.len())] {
-        for k in 0..reps {
-            for m in &maps[lo..hi] {
-                let p = sys::anon(m.len + 4096, true);
-                let buf = unsafe { std::slice::from_raw_parts_mut(p, m.len) };
-                buf.copy_from_slice(m.bytes());
-                tile_ids(buf, k as u8);
-                tiled.push(sys::Mapped { ptr: p, len: m.len });
+    // tiles, built in parallel: tiles[kind][k * files_of_kind + i]
+    let t = Instant::now();
+    let kinds = [(0usize, nev), (nev, nck), (nev + nck, nln)];
+    let jobs: Vec<(usize, usize, usize)> = (0..3).flat_map(|kd| (0..big).flat_map(move |k| (0..kinds[kd].1).map(move |i| (kd, k, i)))).collect();
+    let next = AtomicUsize::new(0);
+    let mut made: Vec<(usize, usize, usize)> = run_threads(nthreads, |_| {
+        let mut v = Vec::new();
+        loop {
+            let j = next.fetch_add(1, Relaxed);
+            let Some(&(kd, k, i)) = jobs.get(j) else { break };
+            let m = &maps[kinds[kd].0 + i];
+            let p = sys::anon(m.len + 4096, true);
+            let buf = unsafe { std::slice::from_raw_parts_mut(p, m.len) };
+            buf.copy_from_slice(m.bytes());
+            tile_ids(buf, k);
+            v.push((j, p as usize, m.len));
+        }
+        v
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    made.sort();
+    out.push(("tile".into(), t.elapsed().as_secs_f64() * 1e3));
+    let subset = |r: usize| -> Vec<sys::Mapped> {
+        let mut v = Vec::new();
+        let mut off = 0;
+        for (_, n) in kinds {
+            v.extend(made[off..off + r * n].iter().map(|&(_, p, len)| sys::Mapped { ptr: p as *const u8, len }));
+            off += big * n;
+        }
+        v
+    };
+    let bdir = out_dir.join("_bench");
+
+    // whole pipeline: label, repetitions of the inputs, PBITS, BBITS (0 = automatic)
+    let runs: [(&str, usize, u32, u32); 11] = [
+        ("La", big, 0, 0),
+        ("L8", big, 8, 8),
+        ("L9", big, 9, 9),
+        ("L10", big, 10, 10),
+        ("L12", big, 12, 12),
+        ("Lp12b9", big, 12, 9),
+        ("Sa", small, 0, 0),
+        ("Sa2", small, 0, 0),
+        ("S8", small, 8, 8),
+        ("S9", small, 9, 9),
+        ("S11", small, 11, 11),
+    ];
+    for (label, reps, pb, bb) in runs {
+        let mark = sys::bump_mark();
+        let tiled = subset(reps);
+        let _ = std::fs::remove_dir_all(&bdir);
+        std::fs::create_dir_all(bdir.join("user_daily")).unwrap();
+        std::fs::create_dir_all(bdir.join("campaign_daily")).unwrap();
+        unsafe {
+            if pb > 0 {
+                std::env::set_var("PBITS", pb.to_string());
+                std::env::set_var("BBITS", bb.to_string());
+            } else {
+                std::env::remove_var("PBITS");
+                std::env::remove_var("BBITS");
             }
         }
+        let t = Instant::now();
+        let marks: std::sync::Mutex<([(u16, f64); 16], usize)> = std::sync::Mutex::new(([(0, 0.0); 16], 0));
+        let d2 = data.to_path_buf();
+        let c = pipeline(&tiled, &[], reps * nev, reps * nck, ws, we, move || load_lookups(&d2), &bdir, nthreads, false, &|w: &str| {
+            let mut g = marks.lock().unwrap();
+            let n = g.1;
+            if n < 16 {
+                g.0[n] = ((w.as_bytes()[0] as u16) << 8 | w.as_bytes()[1] as u16, t.elapsed().as_secs_f64() * 1e3);
+                g.1 = n + 1;
+            }
+        });
+        std::mem::forget(c);
+        let (m, n) = marks.into_inner().unwrap();
+        let at = |a: u8, b: u8| m[..n].iter().rev().find(|x| x.0 == (a as u16) << 8 | b as u16).map(|x| x.1).unwrap_or(0.0);
+        let (lo, pa, de, se, wr) = (at(b'l', b'o'), at(b'p', b'a'), at(b'd', b'e'), at(b's', b'e'), at(b'w', b'r'));
+        std::mem::forget(tiled);
+        sys::bump_reset(mark);
+        out.push((format!("{label}:{:.0}/{:.0}/{:.0}/{:.0}", lo, pa - lo, de - pa, se - de), wr));
     }
-    let (tnev, tnck) = (nev * reps, nck * reps);
-    // the parse phase alone, before anything else has run on this data
+    unsafe {
+        std::env::remove_var("PBITS");
+        std::env::remove_var("BBITS");
+    }
+    let _ = std::fs::remove_dir_all(&bdir);
+
+    // the parse phase: fresh mappings of the real files (twice), then anonymous copies
     {
-        let mut c1m = Vec::new();
-        make_chunks(&tiled[..tnev], 0, 0, 1 << 20, &mut c1m);
-        make_chunks(&tiled[tnev..tnev + tnck], tnev, 1, 1 << 20, &mut c1m);
-        let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
-        let fm = std::env::var("FIRSTMODE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
-        let pp = PP { sub: 16 << 10, pbits: _ctx.pbits.max(9), bbits: _ctx.bbits.max(9), mode: fm, pread: false, huge: std::env::var("FIRSTNOHUGE").is_err(), block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
-        for name in ["first", "second"] {
+        let ev_files = csv_files(&data.join("events"));
+        let ck_files = csv_files(&data.join("clicks"));
+        let mut fresh: Vec<sys::Mapped> = Vec::new();
+        for fl in [&ev_files, &ck_files] {
+            for _ in 0..small {
+                fresh.extend(fl.iter().map(|p| sys::Mapped::open(p, false).unwrap().0));
+            }
+        }
+        let anon = subset(small);
+        let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * small + (64 << 20);
+        let pp = PP { sub: 16 << 10, pbits: 10, bbits: 10, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
+        for (name, set) in [("ffresh", &fresh), ("fwarm", &fresh), ("anon", &anon), ("anon2", &anon)] {
+            let mut ch = Vec::new();
+            make_chunks(&set[..small * nev], 0, 0, 1 << 20, &mut ch);
+            make_chunks(&set[small * nev..small * (nev + nck)], small * nev, 1, 1 << 20, &mut ch);
             let t = Instant::now();
-            let mut parsed = parse_phase(_ctx, &tiled, files, &c1m, &pp);
+            let mut parsed = parse_phase(_ctx, set, files, &ch, &pp);
             out.push((name.into(), t.elapsed().as_secs_f64() * 1e3));
             for p in parsed.iter_mut() {
                 p.arena.free();
             }
         }
-    }
-    let bdir = out_dir.join("_bench");
-    let mut tctx: Option<Ctx> = None;
-    for (round, threads) in [(0usize, nthreads), (1, nthreads), (2, (nthreads / 2).max(1))] {
-        let _ = std::fs::remove_dir_all(&bdir);
-        std::fs::create_dir_all(bdir.join("user_daily")).unwrap();
-        std::fs::create_dir_all(bdir.join("campaign_daily")).unwrap();
-        let t = Instant::now();
-        let marks: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
-        let d2 = data.to_path_buf();
-        let c = pipeline(&tiled, &[], tnev, tnck, ws, we, move || load_lookups(&d2), &bdir, threads, false, &|w: &str| {
-            let name: String = w.chars().take_while(|c| c.is_ascii_alphabetic() || *c == ' ').take(7).collect::<String>().replace(' ', "");
-            marks.lock().unwrap().push((name, t.elapsed().as_secs_f64() * 1e3));
-        });
-        tctx = Some(c);
-        let mut prev = 0.0;
-        for (n, v) in marks.into_inner().unwrap() {
-            out.push((format!("{}{}", ["A", "B", "H"][round], &n[..n.len().min(5)]), v - prev));
-            prev = v;
-        }
-    }
-    let t = Instant::now();
-    let _ = std::fs::remove_dir_all(&bdir);
-    out.push(("rmout".into(), t.elapsed().as_secs_f64() * 1e3));
-    let tctx = tctx.unwrap();
-
-    // 2. parse-phase variants on the tiled inputs
-    let mut c1m = Vec::new();
-    make_chunks(&tiled[..tnev], 0, 0, 1 << 20, &mut c1m);
-    make_chunks(&tiled[tnev..tnev + tnck], tnev, 1, 1 << 20, &mut c1m);
-    let arena_cap = (ev_bytes / 36 * 32 + ck_bytes / 20 * 24) * reps + (64 << 20);
-    let base = PP { sub: 16 << 10, pbits: tctx.pbits, bbits: tctx.bbits, mode: 0, pread: false, huge: true, block: BLOCK, threads: nthreads, pf: PF, arena_cap, nt: false };
-    let half = (nthreads / 2).max(1);
-    let mut run = |name: &str, pp: PP| {
-        let mut best = f64::MAX;
-        for _ in 0..2 {
-            let t = Instant::now();
-            let mut parsed = parse_phase(&tctx, &tiled, files, &c1m, &pp);
-            best = best.min(t.elapsed().as_secs_f64() * 1e3);
-            for p in parsed.iter_mut() {
-                p.arena.free();
-            }
-        }
-        out.push((name.to_string(), best));
-    };
-    run("tch", PP { mode: 3, ..base });
-    run("idx", PP { mode: 1, ..base });
-    run("dec", PP { mode: 2, ..base });
-    run("full", base);
-    run("tch4", PP { mode: 3, threads: half, ..base });
-    run("idx4", PP { mode: 1, threads: half, ..base });
-    run("dec4", PP { mode: 2, threads: half, ..base });
-    run("full4", PP { threads: half, ..base });
-    run("b8", PP { pbits: 8, bbits: 8, ..base });
-    run("b12", PP { pbits: 12, bbits: 12, ..base });
-    run("nohuge", PP { huge: false, ..base });
-    run("s4k", PP { sub: 4 << 10, ..base });
-    run("s64k", PP { sub: 64 << 10, ..base });
-    run("pf0", PP { pf: usize::MAX / 2, ..base });
-    run("blk1k", PP { block: 1024, ..base });
-    run("nt", PP { nt: true, ..base });
-    run("nt4", PP { nt: true, threads: half, ..base });
-    run("ntb12", PP { nt: true, pbits: 12, bbits: 12, ..base });
-    run("ntb8", PP { nt: true, pbits: 8, bbits: 8, ..base });
-
-    // 3. fresh mappings of the real inputs: first-touch and page-drop cost
-    {
-        let ev_files = csv_files(&data.join("events"));
-        let fresh: Vec<sys::Mapped> = ev_files.iter().map(|p| sys::Mapped::open(p, false).unwrap().0).collect();
-        let mut ch = Vec::new();
-        make_chunks(&fresh, 0, 0, 1 << 20, &mut ch);
-        let pp = PP { mode: 3, ..base };
-        let t = Instant::now();
-        parse_phase(&tctx, &fresh, files, &ch, &pp);
-        out.push(("ftouch".into(), t.elapsed().as_secs_f64() * 1e3));
         let t = Instant::now();
         let next = AtomicUsize::new(0);
         run_threads(nthreads, |_| loop {
@@ -1809,15 +1831,16 @@ fn self_bench(_ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], nev: us
         });
         out.push(("fdrop".into(), t.elapsed().as_secs_f64() * 1e3));
     }
-    let _ = maps;
-    // fixed costs
+    // giving back the tiles: what tearing down huge-page memory costs
     let t = Instant::now();
-    for _ in 0..20 {
-        run_threads(nthreads, |_| 0u8);
+    let bytes: usize = made.iter().map(|x| x.2).sum();
+    for &(_, p, len) in &made {
+        sys::unmap(p as *const u8, len + 4096);
     }
-    let spawn = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+    out.push((format!("unmap{}M", bytes >> 20), t.elapsed().as_secs_f64() * 1e3));
+
     let mut rows = Vec::new();
-    let mut cur = format!("!F reps{reps} spawn8={spawn:.2} |");
+    let mut cur = format!("!F big{big} small{small} |");
     for (n, v) in &out {
         let item = format!(" {n}={v:.0}");
         if cur.len() + item.len() > 215 {
