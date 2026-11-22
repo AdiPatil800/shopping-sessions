@@ -649,7 +649,7 @@ fn pipeline(maps: &[sys::Mapped], files: &[std::fs::File], nev: usize, nck: usiz
     let csize = envu("CHUNK").unwrap_or(1 << 20);
     make_chunks(&maps[..nev], 0, 0, csize, &mut chunks);
     make_chunks(&maps[nev..nev + nck], nev, 1, csize, &mut chunks);
-    let arena_cap = ev_bytes / 36 * 48 + ck_bytes / 20 * 24 + (3 * np + nb) * BLOCK * 24 + (16 << 20);
+    let arena_cap = ev_bytes / 36 * 48 + ck_bytes / 20 * 24 + (3 * np + nb) * buf::BB + (16 << 20);
     let pp = PP {
         sub: envu("SUB").unwrap_or(16 << 10),
         pbits: ctx.pbits,
@@ -772,10 +772,10 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                 *PRE_T0.lock().unwrap() = Some(Instant::now());
             }
         }
-        let mut es: Streams<ER> = Streams::new(np, pp.block, pp.nt);
-        let mut ss: Streams<SR> = Streams::new(nb, pp.block, pp.nt);
-        let mut cs: Streams<CR> = Streams::new(np, pp.block, false);
-        let mut ns: Streams<NS> = Streams::new(np, pp.block, false);
+        let mut es: Streams<ER> = Streams::new(np, &arena);
+        let mut ss: Streams<SR> = Streams::new(nb, &arena);
+        let mut cs: Streams<CR> = Streams::new(np, &arena);
+        let mut ns: Streams<NS> = Streams::new(np, &arena);
         let mut lr: Vec<LR> = Vec::with_capacity(1 << 12);
         let mut lc: Vec<LC> = Vec::with_capacity(1 << 12);
         let mut ix = scan2::Index::new();
@@ -864,8 +864,6 @@ fn parse_phase(ctx: &Ctx, maps: &[sys::Mapped], files: &[std::fs::File], chunks:
                 pos = next_pos;
             }
         }
-        es.finish();
-        ss.finish();
         std::hint::black_box(sink);
         if timing {
             eprintln!("  parse thread: ev scan {:.1} emit {:.1} | ck scan {:.1} emit {:.1} ms", tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3);
